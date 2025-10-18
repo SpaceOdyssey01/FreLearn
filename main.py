@@ -550,7 +550,19 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
     hl_fuse   = FuseHL(dim=128, dropout=DROPOUT).to(device)
     classifier= ClassifierHead(in_dim=128, num_classes=num_classes, dropout=DROPOUT).to(device)
 
-    hlf_seq_loss = HLF_RelationLoss_BP(
+    hlf_seq_loss1 = HLF_RelationLoss_BP(
+        temperature=0.15, pool_hw=(4, 4),
+        w_hh_low=1.0, w_hv_low=1.0, w_hd_low=1.0,
+        proj_hidden=256, proj_out=128, p_drop=0.2
+    ).to(device)
+
+    hlf_seq_lossM = HLF_RelationLoss_BP(
+        temperature=0.15, pool_hw=(4, 4),
+        w_hh_low=1.0, w_hv_low=1.0, w_hd_low=1.0,
+        proj_hidden=256, proj_out=128, p_drop=0.2
+    ).to(device)
+
+    hlf_seq_loss2 = HLF_RelationLoss_BP(
         temperature=0.15, pool_hw=(4, 4),
         w_hh_low=1.0, w_hv_low=1.0, w_hd_low=1.0,
         proj_hidden=256, proj_out=128, p_drop=0.2
@@ -568,9 +580,10 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
         p = max(1e-6, pos / max(1.0, (pos + neg)));
         prior_bias = math.log(p / (1.0 - p))
         final_linear = classifier.classifier[-1]
-        # 预建 projector（关系向量维：128 + 4*4）
-        hlf_seq_loss._ensure_projector(in_dim=128 + 4 * 4, device=device)
-        _ = hlf_seq_loss.proj(torch.randn(2, 128 + 16, device=device))
+        in_dim_rel = 128 + 4 * 4  # 关系向量维
+        for _hlf in (hlf_seq_loss1, hlf_seq_lossM, hlf_seq_loss2):
+            _hlf._ensure_projector(in_dim=in_dim_rel, device=device)
+            _ = _hlf.proj(torch.randn(2, in_dim_rel, device=device))
         if isinstance(final_linear, nn.Linear) and final_linear.bias is not None and final_linear.out_features == 2:
             final_linear.bias.data[1] += prior_bias / 2.0;
             final_linear.bias.data[0] -= prior_bias / 2.0
@@ -582,6 +595,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
         "lowM": conv_low_M, "hhM": conv_hh_M, "hvM": conv_hv_M, "hdM": conv_hd_M,
         # Stage-2
         "low2": conv_low_2, "hh2": conv_hh_2, "hv2": conv_hv_2, "hd2": conv_hd_2,
+        "hlf1": hlf_seq_loss1, "hlfM": hlf_seq_lossM, "hlf2": hlf_seq_loss2,
         # shared
         "hlfuse": hl_fuse, "cls": classifier, "high_gate": high_gate,
         "mod": modulator, "resf": resfuser
@@ -600,7 +614,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
           conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
           conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2]:
         add_module(m, BACKBONE_LR)
-    for m in [high_gate, hl_fuse, classifier, hlf_seq_loss, modulator, resfuser]:
+    for m in [high_gate, hl_fuse, classifier, hlf_seq_loss1, hlf_seq_loss2,hlf_seq_lossM,modulator, resfuser]:
         add_module(m, HEAD_LR)
     optimizer = torch.optim.AdamW(optim_params)
     scheduler = WarmupCosineLR(optimizer, warmup_epochs=5, max_epochs=epochs, min_factor=0.08)
@@ -637,7 +651,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
         for m in [conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
           conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
           conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
-          high_gate, hl_fuse, classifier, hlf_seq_loss, modulator, resfuser]:
+          high_gate, hl_fuse, classifier, hlf_seq_loss1, hlf_seq_loss2,hlf_seq_lossM,modulator, resfuser]:
             m.train()
         total_cl, total_cls, total_bal = 0.0, 0.0, 0.0;
         correct = 0;
@@ -662,7 +676,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                     conv_low=conv_low_1, conv_hh=conv_hh_1, conv_hv=conv_hv_1, conv_hd=conv_hd_1,
                     high_gate=high_gate, hl_fuse=hl_fuse,
                     modulator=modulator, resfuser=resfuser,
-                    hlf_seq_loss=hlf_seq_loss, use_amp=use_amp,
+                    hlf_seq_loss=hlf_seq_loss1, use_amp=use_amp,
                     scale=STAGE1_SCALE, resizer=resizer
                 )
 
@@ -672,7 +686,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                     conv_low=conv_low_M, conv_hh=conv_hh_M, conv_hv=conv_hv_M, conv_hd=conv_hd_M,
                     high_gate=high_gate, hl_fuse=hl_fuse,
                     modulator=modulator, resfuser=resfuser,
-                    hlf_seq_loss=hlf_seq_loss, use_amp=use_amp,
+                    hlf_seq_loss=hlf_seq_lossM, use_amp=use_amp,
                     scale=STAGEM_SCALE, resizer=resizer
                 )
 
@@ -684,7 +698,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                 vec_hh2,  feat_hh2  = conv_hh_2(hh2.float(), return_vec=True, return_feat=True)
                 vec_hv2,  feat_hv2  = conv_hv_2(hv2.float(), return_vec=True, return_feat=True)
                 vec_hd2,  feat_hd2  = conv_hd_2(hd2.float(), return_vec=True, return_feat=True)
-                cl_loss2 = hlf_seq_loss(feat_hh2.float(), feat_hv2.float(), feat_hd2.float(), feat_low2.float())
+                cl_loss2 = hlf_seq_loss2(feat_hh2.float(), feat_hv2.float(), feat_hd2.float(), feat_low2.float())
 
                 three2 = torch.stack([vec_hh2, vec_hv2, vec_hd2], dim=1)
                 gate3_2 = torch.softmax(high_gate(three2), dim=1)
@@ -749,8 +763,9 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                 gate_reg = GATE_REG_W * F.kl_div(gate3_2.mean(0).clamp_min(1e-8).log(), u3, reduction='sum')
                 bal_loss = BALANCE_LOSS_W * (logits_train.mean(dim=0) ** 2).sum()
 
-                cl_loss = cl_loss1 + cl_lossM + cl_loss2
-                loss = W_CL * cl_loss + W_CLS * cls_loss + bal_loss + prob_bal + gate_reg
+                cl_loss_total = W_CL1 * cl_loss1 + W_CLM * cl_lossM + W_CL2 * cl_loss2
+
+                loss = (W_CL * cl_loss_total) + (W_CLS * cls_loss) + bal_loss + prob_bal + gate_reg
                 if not torch.isfinite(loss):
                     # 跳过这个 batch，避免污染权重
                     optimizer.zero_grad(set_to_none=True)
@@ -767,7 +782,8 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                 list(conv_low_2.parameters()) + list(conv_hh_2.parameters()) +
                 list(conv_hv_2.parameters()) + list(conv_hd_2.parameters()) +
                 list(high_gate.parameters()) + list(hl_fuse.parameters()) +
-                list(classifier.parameters()) + list(hlf_seq_loss.parameters()) +
+                list(classifier.parameters()) + list(hlf_seq_loss1.parameters()) +
+                list(hlf_seq_loss2.parameters()) +list(hlf_seq_lossM.parameters()) +
                 list(modulator.parameters()) + list(resfuser.parameters()),
                 max_norm=0.5
             )
@@ -776,7 +792,8 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
             ema.update(ema_modules)
 
             bs = y.size(0);
-            total_cl += cl_loss.item() * bs;
+            total_cl += cl_loss_total.item() * bs
+
             total_cls += cls_loss.item() * bs;
             total_bal += bal_loss.item() * bs
             pred = logits_clean.argmax(dim=1);
@@ -787,7 +804,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
         for m in [conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
           conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
           conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
-          high_gate, hl_fuse, classifier, hlf_seq_loss, modulator, resfuser]:
+          high_gate, hl_fuse, classifier, hlf_seq_loss1,hlf_seq_loss2,hlf_seq_lossM, modulator, resfuser]:
             m.eval()
         scheduler.step()
         train_acc = 100.0 * correct / max(1, total);
@@ -818,7 +835,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                             conv_low=conv_low_1, conv_hh=conv_hh_1, conv_hv=conv_hv_1, conv_hd=conv_hd_1,
                             high_gate=high_gate, hl_fuse=hl_fuse,
                             modulator=modulator, resfuser=resfuser,
-                            hlf_seq_loss=hlf_seq_loss, use_amp=use_amp,
+                            hlf_seq_loss=hlf_seq_loss1, use_amp=use_amp,
                             scale=STAGE1_SCALE, resizer=resizer
                         )
 
@@ -828,7 +845,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                             conv_low=conv_low_M, conv_hh=conv_hh_M, conv_hv=conv_hv_M, conv_hd=conv_hd_M,
                             high_gate=high_gate, hl_fuse=hl_fuse,
                             modulator=modulator, resfuser=resfuser,
-                            hlf_seq_loss=hlf_seq_loss, use_amp=use_amp,
+                            hlf_seq_loss=hlf_seq_lossM, use_amp=use_amp,
                             scale=STAGEM_SCALE, resizer=resizer
                         )
 
@@ -841,7 +858,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                         vec_hh2,  feat_hh2  = conv_hh_2(hh2.float(), return_vec=True, return_feat=True)
                         vec_hv2,  feat_hv2  = conv_hv_2(hv2.float(), return_vec=True, return_feat=True)
                         vec_hd2,  feat_hd2  = conv_hd_2(hd2.float(), return_vec=True, return_feat=True)
-                        cl_loss2 = hlf_seq_loss(feat_hh2, feat_hv2, feat_hd2, feat_low2)
+                        cl_loss2 = hlf_seq_loss2(feat_hh2, feat_hv2, feat_hd2, feat_low2)
                         three2 = torch.stack([vec_hh2, vec_hv2, vec_hd2], dim=1)
                         gate3_2 = torch.softmax(high_gate(three2), dim=1)
                         high_vec2 = (three2 * gate3_2).sum(dim=1)
@@ -849,7 +866,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
 
                         logits = classifier(fused2);
                         cls_loss = F.cross_entropy(logits, y)
-                        cl_loss = cl_loss1 + cl_lossM + cl_loss2
+                        cl_loss = W_CL1*cl_loss1 + W_CLM*cl_lossM + W_CL2*cl_loss2
                     bs = y.size(0);
                     val_cl += cl_loss.item() * bs;
                     val_cls += cls_loss.item() * bs;
@@ -901,27 +918,22 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                 'conv_low_2': conv_low_2.state_dict(), 'conv_hh_2': conv_hh_2.state_dict(),
                 'conv_hv_2': conv_hv_2.state_dict(), 'conv_hd_2': conv_hd_2.state_dict(),
                 # shared
-                'high_gate': high_gate.state_dict(), 'hl_fuse': hl_fuse.state_dict(),
-                'classifier': classifier.state_dict(), 'hlf_seq_loss': hlf_seq_loss.state_dict(),
-                'modulator': modulator.state_dict(), 'resfuser': resfuser.state_dict(),
-                # meta...
                 'high_gate': high_gate.state_dict(),
                 'hl_fuse': hl_fuse.state_dict(),
                 'classifier': classifier.state_dict(),
-                'hlf_seq_loss': hlf_seq_loss.state_dict(),
                 'modulator': modulator.state_dict(),
                 'resfuser': resfuser.state_dict(),
-                # --- 元信息 ---
-                'epoch': epoch,
-                'best_thr': float(best_thr),
-                'best_metric_bal_acc': metric,                  # 或 best_val_metric，看你想存哪一个
-                'val_acc_at_best': float(val_acc),
-                'val_f1_at_best': float(f1),
-                'val_auc_at_best': float(auc),
-                # --- EMA ---
-                'ema_shadow': ema.shadow,
-                'ema_decay': EMA_DECAY,
+                # 3个阶段的 HLF
+                'hlf_seq_loss1': hlf_seq_loss1.state_dict(),
+                'hlf_seq_lossM': hlf_seq_lossM.state_dict(),
+                'hlf_seq_loss2': hlf_seq_loss2.state_dict(),
+                # --- 元信息 / EMA ---
+                'epoch': epoch, 'best_thr': float(best_thr),
+                'best_metric_bal_acc': metric, 'val_acc_at_best': float(val_acc),
+                'val_f1_at_best': float(f1), 'val_auc_at_best': float(auc),
+                'ema_shadow': ema.shadow, 'ema_decay': EMA_DECAY,
             }, os.path.join(result_dir, "best_model.pt"))
+
 
             bad_epochs = 0
         else:
