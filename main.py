@@ -1,7 +1,8 @@
 from config import *
 from ae import *
-
-
+from wt_utils import *
+from data import *
+from contrast import HLF_RelationLoss_BP
 
 
 class Resize2D(nn.Module):
@@ -23,38 +24,8 @@ class Resize2D(nn.Module):
             return F.interpolate(x, size=size, mode=self.mode, align_corners=False, antialias=self.antialias)
 
 
-# ==== 小波变换 ====
-class WaveletTransform(nn.Module):
-    def __init__(self, wave: str = 'coif1', device: str = 'cpu'):
-        super().__init__()
-        self.wave_name = wave
-        self._device = torch.device(device if (device == "cuda" and torch.cuda.is_available()) else "cpu")
-        self.dwt1 = DWTForward(J=1, wave=wave).to(self._device).eval()
-        self.idwt1 = DWTInverse(wave=wave).to(self._device).eval()
-
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor):
-        x = x.to(self._device).float()
-        yl1, yh1_list = self.dwt1(x)  # yl1: [B,C,H/2,W/2], yh1_list[0]: [B,C,3,H/2,W/2]
-        yh1 = yh1_list[0]
-        return yl1, yh1[:, :, 0], yh1[:, :, 1], yh1[:, :, 2]
-
-    @torch.no_grad()
-    def inverse(self, low: torch.Tensor, hh: torch.Tensor, hv: torch.Tensor, hd: torch.Tensor):
-        yl = low.to(self._device).float()
-        yh = torch.stack([hh, hv, hd], dim=2).to(self._device).float()  # [B,C,3,H/2,W/2]
-        x = self.idwt1((yl, [yh]))
-        return x
 
 
-@torch.no_grad()
-def _pad_to_even(x: torch.Tensor):
-    _, _, H, W = x.shape
-    ph = 1 if (H % 2 == 1) else 0
-    pw = 1 if (W % 2 == 1) else 0
-    if ph or pw:
-        x = F.pad(x, (0, pw, 0, ph), mode='reflect')
-    return x, ph, pw
 
 
 
@@ -191,82 +162,6 @@ def prob_balance_loss_from_logits(logits, target_prior=None):
     p = F.softmax(logits, dim=1).mean(dim=0).clamp_min(1e-8)
     target = torch.full_like(p, 1.0 / p.numel()) if target_prior is None else target_prior.to(p)
     return F.kl_div(p.log(), target, reduction='batchmean')
-
-
-class _RelationProjector(nn.Module):
-    def __init__(self, in_dim, hid=256, out_dim=128, p_drop=0.2):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hid), nn.GELU(), nn.Dropout(p_drop),
-            nn.Linear(hid, out_dim)
-        )
-
-    def forward(self, x):
-        z = self.net(x)
-        return F.normalize(z, dim=-1)
-
-
-def _relation_vector(A: torch.Tensor, B: torch.Tensor, pool_hw=(4, 4)):
-    assert A.shape == B.shape and A.dim() == 4
-    Bsz, C, Hp, Wp = A.shape
-    Ach = A.flatten(2);
-    Bch = B.flatten(2)
-    num = (Ach * Bch).sum(dim=2);
-    den = (Ach.norm(dim=2) * Bch.norm(dim=2)).clamp_min(1e-8)
-    rel_ch = (num / den)
-    Ab = F.normalize(A, dim=1);
-    Bb = F.normalize(B, dim=1)
-    rel_sp = (Ab * Bb).sum(dim=1, keepdim=True)
-    ph, pw = pool_hw
-    rel_sp = F.adaptive_avg_pool2d(rel_sp, output_size=(ph, pw)).flatten(1)
-    r = torch.cat([rel_ch, rel_sp], dim=1)
-    r = torch.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
-    return r
-
-
-class HLF_RelationLoss_BP(nn.Module):
-    def __init__(self, temperature=0.07, pool_hw=(4, 4),
-                 w_hh_low=1.0, w_hv_low=1.0, w_hd_low=1.0,
-                 proj_hidden=256, proj_out=128, p_drop=0.2):
-        super().__init__()
-        self.tau = float(temperature)
-        self.pool_hw = pool_hw
-        self.proj = None
-        self.w = {'hh_low': w_hh_low, 'hv_low': w_hv_low, 'hd_low': w_hd_low}
-        self.ntxent = NTXentLoss(temperature=self.tau)
-        self.proj_hidden = proj_hidden
-        self.proj_out = proj_out
-        self.p_drop = p_drop
-
-    def _ensure_projector(self, in_dim, device):
-        if self.proj is None:
-            self.proj = _RelationProjector(in_dim, self.proj_hidden, self.proj_out, self.p_drop).to(device)
-
-    def _pair_nce(self, A, B):
-        r = _relation_vector(A, B, pool_hw=self.pool_hw)
-        self._ensure_projector(r.size(1), r.device)
-        # 视图扰动：给 r 一个极小的高斯抖动，避免完全一致导致退化
-        if self.training:
-            r = r + 1e-4 * torch.randn_like(r)
-
-        z1 = self.proj(r)
-        z2 = self.proj(r)  # 仍保留 Dropout 视图差
-
-        # 再次净化 & 退化检测
-        z1 = torch.nan_to_num(z1)
-        z2 = torch.nan_to_num(z2)
-        # 若 batch 太小/退化，直接返回 0-loss
-        if z1.size(0) < 2:
-            return torch.zeros([], device=z1.device, dtype=z1.dtype)
-        return self.ntxent(torch.cat([z1, z2], dim=0),
-                           torch.cat([torch.arange(z1.size(0), device=z1.device)] * 2, dim=0))
-
-    def forward(self, hh, hv, hd, low):
-        loss = 0.0
-        if self.w['hh_low'] > 0: loss = loss + self.w['hh_low'] * self._pair_nce(hh, low)
-        if self.w['hv_low'] > 0: loss = loss + self.w['hv_low'] * self._pair_nce(hv, low)
-        if self.w['hd_low'] > 0: loss = loss + self.w['hd_low'] * self._pair_nce(hd, low)
-        return loss
 
 
 # ======= CloFormer 风格模块（简化） =======
@@ -550,7 +445,7 @@ def stage_proj_contrast_mod_resfuse(
 ):
     # 1) 记住原始尺寸；pad 到偶数以便 DWT
     H0, W0 = x_in.shape[-2], x_in.shape[-1]
-    x_b, ph, pw = _pad_to_even(x_in)
+    x_b, ph, pw = pad_to_even(x_in)
     # 2) WT
     low, hh, hv, hd = wt(x_b)
 
@@ -627,20 +522,33 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
     sample_weights = (1.0 / (class_count + 1e-6))[y_train]
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
     train_loader = DataLoader(train_set, batch_size=batch_size, sampler=sampler, num_workers=0, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True, drop_last=False)
     train_prior = (torch.bincount(y_train, minlength=num_classes).float());
     train_prior = (train_prior / train_prior.sum()).to('cpu')
     set_class_strength_for_train_dataset(train_set, {0: 1.0, 1: 1.2})
 
     # ----- 模型 -----
-    conv_low = SimpleProjector(in_channels=C, out_dim=128, patch=(16, 3), dropout=DROPOUT).to(device)
-    conv_high_h = SimpleProjector(in_channels=C, out_dim=128, patch=(16, 3), dropout=DROPOUT).to(device)
-    conv_high_v = SimpleProjector(in_channels=C, out_dim=128, patch=(16, 3), dropout=DROPOUT).to(device)
-    conv_high_d = SimpleProjector(in_channels=C, out_dim=128, patch=(16, 3), dropout=DROPOUT).to(device)
+    conv_low_1  = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
+    conv_hh_1   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
+    conv_hv_1   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
+    conv_hd_1   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
 
+    # Stage-M projectors
+    conv_low_M  = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
+    conv_hh_M   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
+    conv_hv_M   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
+    conv_hd_M   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
+
+    # Stage-2 projectors
+    conv_low_2  = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
+    conv_hh_2   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
+    conv_hv_2   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
+    conv_hd_2   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
+
+    # 下面这些仍共享
     high_gate = nn.Sequential(nn.LayerNorm(128), nn.Linear(128, 64), nn.GELU(), nn.Linear(64, 1)).to(device)
-    hl_fuse = FuseHL(dim=128, dropout=DROPOUT).to(device)
-    classifier = ClassifierHead(in_dim=128, num_classes=num_classes, dropout=DROPOUT).to(device)
+    hl_fuse   = FuseHL(dim=128, dropout=DROPOUT).to(device)
+    classifier= ClassifierHead(in_dim=128, num_classes=num_classes, dropout=DROPOUT).to(device)
 
     hlf_seq_loss = HLF_RelationLoss_BP(
         temperature=0.15, pool_hw=(4, 4),
@@ -668,7 +576,13 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
             final_linear.bias.data[0] -= prior_bias / 2.0
 
     ema_modules = {
-        "low": conv_low, "hh": conv_high_h, "hv": conv_high_v, "hd": conv_high_d,
+        # Stage-1
+        "low1": conv_low_1, "hh1": conv_hh_1, "hv1": conv_hv_1, "hd1": conv_hd_1,
+        # Stage-M
+        "lowM": conv_low_M, "hhM": conv_hh_M, "hvM": conv_hv_M, "hdM": conv_hd_M,
+        # Stage-2
+        "low2": conv_low_2, "hh2": conv_hh_2, "hv2": conv_hv_2, "hd2": conv_hd_2,
+        # shared
         "hlfuse": hl_fuse, "cls": classifier, "high_gate": high_gate,
         "mod": modulator, "resf": resfuser
     }
@@ -682,7 +596,9 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
             g["lr"] = lr
             optim_params.append(g)
 
-    for m in [conv_low, conv_high_h, conv_high_v, conv_high_d]:
+    for m in [conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
+          conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
+          conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2]:
         add_module(m, BACKBONE_LR)
     for m in [high_gate, hl_fuse, classifier, hlf_seq_loss, modulator, resfuser]:
         add_module(m, HEAD_LR)
@@ -718,15 +634,17 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                 wcl = wcl * (1 - 0.5 * s)
             W_CLS, W_CL = 1.5, wcl
 
-        for m in [conv_low, conv_high_h, conv_high_v, conv_high_d, high_gate, hl_fuse, classifier, hlf_seq_loss,
-                  modulator, resfuser]:
+        for m in [conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
+          conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
+          conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
+          high_gate, hl_fuse, classifier, hlf_seq_loss, modulator, resfuser]:
             m.train()
         total_cl, total_cls, total_bal = 0.0, 0.0, 0.0;
         correct = 0;
         total = 0;
         pos_cnt = 0
 
-        for batch in train_loader:
+        for it, batch in enumerate(train_loader):
             low = batch['low'].to(device, non_blocking=True)
             hh = batch['high_h'].to(device, non_blocking=True)
             hv = batch['high_v'].to(device, non_blocking=True)
@@ -741,7 +659,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                 x0 = raw if raw is not None else wt_runtime.inverse(low, hh, hv, hd).to(device)
                 fused1, y0, cl_loss1 = stage_proj_contrast_mod_resfuse(
                     x_in=x0, wt=wt_runtime,
-                    conv_low=conv_low, conv_hh=conv_high_h, conv_hv=conv_high_v, conv_hd=conv_high_d,
+                    conv_low=conv_low_1, conv_hh=conv_hh_1, conv_hv=conv_hv_1, conv_hd=conv_hd_1,
                     high_gate=high_gate, hl_fuse=hl_fuse,
                     modulator=modulator, resfuser=resfuser,
                     hlf_seq_loss=hlf_seq_loss, use_amp=use_amp,
@@ -751,7 +669,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                 # ---------- Stage-M：再次 projector→对比→融合→调制→iDWT→残差（按 STAGEM_SCALE） ----------
                 fusedM, y1, cl_lossM = stage_proj_contrast_mod_resfuse(
                     x_in=y0, wt=wt_runtime,
-                    conv_low=conv_low, conv_hh=conv_high_h, conv_hv=conv_high_v, conv_hd=conv_high_d,
+                    conv_low=conv_low_M, conv_hh=conv_hh_M, conv_hv=conv_hv_M, conv_hd=conv_hd_M,
                     high_gate=high_gate, hl_fuse=hl_fuse,
                     modulator=modulator, resfuser=resfuser,
                     hlf_seq_loss=hlf_seq_loss, use_amp=use_amp,
@@ -759,20 +677,36 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                 )
 
                 # ---------- Stage-2：对 y1 再做一轮 WT→投影→对比→融合→分类 ----------
-                y1_b, _, _ = _pad_to_even(y1)
+                y1_b, _, _ = pad_to_even(y1)
                 low2, hh2, hv2, hd2 = wt_runtime(y1_b)
 
-                vec_low2, feat_low2 = conv_low(low2.float(), return_vec=True, return_feat=True)
-                vec_hh2, feat_hh2 = conv_high_h(hh2.float(), return_vec=True, return_feat=True)
-                vec_hv2, feat_hv2 = conv_high_v(hv2.float(), return_vec=True, return_feat=True)
-                vec_hd2, feat_hd2 = conv_high_d(hd2.float(), return_vec=True, return_feat=True)
-
+                vec_low2, feat_low2 = conv_low_2(low2.float(), return_vec=True, return_feat=True)
+                vec_hh2,  feat_hh2  = conv_hh_2(hh2.float(), return_vec=True, return_feat=True)
+                vec_hv2,  feat_hv2  = conv_hv_2(hv2.float(), return_vec=True, return_feat=True)
+                vec_hd2,  feat_hd2  = conv_hd_2(hd2.float(), return_vec=True, return_feat=True)
                 cl_loss2 = hlf_seq_loss(feat_hh2.float(), feat_hv2.float(), feat_hd2.float(), feat_low2.float())
 
                 three2 = torch.stack([vec_hh2, vec_hv2, vec_hd2], dim=1)
                 gate3_2 = torch.softmax(high_gate(three2), dim=1)
                 high_vec2 = (three2 * gate3_2).sum(dim=1)
                 fused2, alpha_hl2 = hl_fuse(vec_low2, high_vec2, return_alpha=True)
+
+                if epoch == 0 and it == 0:
+                    try:
+                        print("[SHAPE] Stage-1:  x0:", tuple(x0.shape),
+                            "  y0(out):", tuple(y0.shape),
+                            "  fused1(vec):", tuple(fused1.shape))
+                        print("[SHAPE] Stage-M:  in(y0):", tuple(y0.shape),
+                            "  y1(out):", tuple(y1.shape),
+                            "  fusedM(vec):", tuple(fusedM.shape))
+                        print("[SHAPE] Stage-2 WT:",
+                            " low2:", tuple(low2.shape),
+                            " hh2:", tuple(hh2.shape),
+                            " hv2:", tuple(hv2.shape),
+                            " hd2:", tuple(hd2.shape))
+                    except Exception as _e:
+                        # 打印失败也不影响训练
+                        pass
 
                 # --- mixup 与分类 ---
                 press_t = torch.tensor([1.0, press_ema], device=fused2.device).detach()
@@ -802,10 +736,10 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                 # --- 其它正则 ---
                 with torch.no_grad():
                     probs_clean = F.softmax(logits_clean, dim=1)[:, 1]
-                    fnr_cur = _batch_fnr(probs_clean, y, thr=train_thr)
+                    fnr_cur = batch_fnr(probs_clean, y, thr=train_thr)
                     if fnr_cur == fnr_cur:
                         fnr_ema = fnr_cur if (fnr_ema is None) else (SMOOTH * fnr_ema + (1.0 - SMOOTH) * fnr_cur)
-                    press_cur = _map_fnr_to_press(fnr_ema if fnr_ema is not None else 0.0, LOW, HIGH, TARGET_LOW,
+                    press_cur = map_fnr_to_press(fnr_ema if fnr_ema is not None else 0.0, LOW, HIGH, TARGET_LOW,
                                                   TARGET_HIGH)
                     press_ema = SMOOTH * press_ema + (1.0 - SMOOTH) * press_cur
 
@@ -826,8 +760,12 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
-                list(conv_low.parameters()) + list(conv_high_h.parameters()) +
-                list(conv_high_v.parameters()) + list(conv_high_d.parameters()) +
+                list(conv_low_1.parameters()) + list(conv_hh_1.parameters()) +
+                list(conv_hv_1.parameters()) + list(conv_hd_1.parameters()) +
+                list(conv_low_M.parameters()) + list(conv_hh_M.parameters()) +
+                list(conv_hv_M.parameters()) + list(conv_hd_M.parameters()) +
+                list(conv_low_2.parameters()) + list(conv_hh_2.parameters()) +
+                list(conv_hv_2.parameters()) + list(conv_hd_2.parameters()) +
                 list(high_gate.parameters()) + list(hl_fuse.parameters()) +
                 list(classifier.parameters()) + list(hlf_seq_loss.parameters()) +
                 list(modulator.parameters()) + list(resfuser.parameters()),
@@ -846,8 +784,10 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
             pos_cnt += (pred == 1).sum().item();
             total += bs
 
-        for m in [conv_low, conv_high_h, conv_high_v, conv_high_d, high_gate, hl_fuse, classifier, hlf_seq_loss,
-                  modulator, resfuser]:
+        for m in [conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
+          conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
+          conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
+          high_gate, hl_fuse, classifier, hlf_seq_loss, modulator, resfuser]:
             m.eval()
         scheduler.step()
         train_acc = 100.0 * correct / max(1, total);
@@ -875,7 +815,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                         x0 = raw if raw is not None else wt_runtime.inverse(low, hh, hv, hd).to(device)
                         fused1, y0, cl_loss1 = stage_proj_contrast_mod_resfuse(
                             x_in=x0, wt=wt_runtime,
-                            conv_low=conv_low, conv_hh=conv_high_h, conv_hv=conv_high_v, conv_hd=conv_high_d,
+                            conv_low=conv_low_1, conv_hh=conv_hh_1, conv_hv=conv_hv_1, conv_hd=conv_hd_1,
                             high_gate=high_gate, hl_fuse=hl_fuse,
                             modulator=modulator, resfuser=resfuser,
                             hlf_seq_loss=hlf_seq_loss, use_amp=use_amp,
@@ -885,7 +825,7 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                         # Stage-M（验证同样按 STAGEM_SCALE）
                         fusedM, y1, cl_lossM = stage_proj_contrast_mod_resfuse(
                             x_in=y0, wt=wt_runtime,
-                            conv_low=conv_low, conv_hh=conv_high_h, conv_hv=conv_high_v, conv_hd=conv_high_d,
+                            conv_low=conv_low_M, conv_hh=conv_hh_M, conv_hv=conv_hv_M, conv_hd=conv_hd_M,
                             high_gate=high_gate, hl_fuse=hl_fuse,
                             modulator=modulator, resfuser=resfuser,
                             hlf_seq_loss=hlf_seq_loss, use_amp=use_amp,
@@ -893,14 +833,14 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
                         )
 
                         # Stage-2
-                        y1_b, _, _ = _pad_to_even(y1)
+                        y1_b, _, _ = pad_to_even(y1)
                         low2, hh2, hv2, hd2 = wt_runtime(y1_b)
 
-                        vec_low2, feat_low2 = conv_low(low2, return_vec=True, return_feat=True)
-                        vec_hh2, feat_hh2 = conv_high_h(hh2, return_vec=True, return_feat=True)
-                        vec_hv2, feat_hv2 = conv_high_v(hv2, return_vec=True, return_feat=True)
-                        vec_hd2, feat_hd2 = conv_high_d(hd2, return_vec=True, return_feat=True)
 
+                        vec_low2, feat_low2 = conv_low_2(low2.float(), return_vec=True, return_feat=True)
+                        vec_hh2,  feat_hh2  = conv_hh_2(hh2.float(), return_vec=True, return_feat=True)
+                        vec_hv2,  feat_hv2  = conv_hv_2(hv2.float(), return_vec=True, return_feat=True)
+                        vec_hd2,  feat_hd2  = conv_hd_2(hd2.float(), return_vec=True, return_feat=True)
                         cl_loss2 = hlf_seq_loss(feat_hh2, feat_hv2, feat_hd2, feat_low2)
                         three2 = torch.stack([vec_hh2, vec_hv2, vec_hd2], dim=1)
                         gate3_2 = torch.softmax(high_gate(three2), dim=1)
@@ -951,15 +891,38 @@ def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch
             best_pack = {"val_acc": float(val_acc), "bal_acc": float(bal_acc * 100.0), "f1": float(f1),
                          "auc": float(auc)}
             torch.save({
-                'conv_low': conv_low.state_dict(), 'conv_high_h': conv_high_h.state_dict(),
-                'conv_high_v': conv_high_v.state_dict(), 'conv_high_d': conv_high_d.state_dict(),
+                # Stage-1
+                'conv_low_1': conv_low_1.state_dict(), 'conv_hh_1': conv_hh_1.state_dict(),
+                'conv_hv_1': conv_hv_1.state_dict(), 'conv_hd_1': conv_hd_1.state_dict(),
+                # Stage-M
+                'conv_low_M': conv_low_M.state_dict(), 'conv_hh_M': conv_hh_M.state_dict(),
+                'conv_hv_M': conv_hv_M.state_dict(), 'conv_hd_M': conv_hd_M.state_dict(),
+                # Stage-2
+                'conv_low_2': conv_low_2.state_dict(), 'conv_hh_2': conv_hh_2.state_dict(),
+                'conv_hv_2': conv_hv_2.state_dict(), 'conv_hd_2': conv_hd_2.state_dict(),
+                # shared
                 'high_gate': high_gate.state_dict(), 'hl_fuse': hl_fuse.state_dict(),
                 'classifier': classifier.state_dict(), 'hlf_seq_loss': hlf_seq_loss.state_dict(),
                 'modulator': modulator.state_dict(), 'resfuser': resfuser.state_dict(),
-                'epoch': epoch, 'best_metric_bal_acc': best_val_metric, 'best_thr': best_thr_to_save,
-                'val_acc_at_best': float(val_acc), 'val_f1_at_best': float(f1), 'val_auc_at_best': float(auc),
-                'ema_shadow': ema.shadow, 'ema_decay': EMA_DECAY,
+                # meta...
+                'high_gate': high_gate.state_dict(),
+                'hl_fuse': hl_fuse.state_dict(),
+                'classifier': classifier.state_dict(),
+                'hlf_seq_loss': hlf_seq_loss.state_dict(),
+                'modulator': modulator.state_dict(),
+                'resfuser': resfuser.state_dict(),
+                # --- 元信息 ---
+                'epoch': epoch,
+                'best_thr': float(best_thr),
+                'best_metric_bal_acc': metric,                  # 或 best_val_metric，看你想存哪一个
+                'val_acc_at_best': float(val_acc),
+                'val_f1_at_best': float(f1),
+                'val_auc_at_best': float(auc),
+                # --- EMA ---
+                'ema_shadow': ema.shadow,
+                'ema_decay': EMA_DECAY,
             }, os.path.join(result_dir, "best_model.pt"))
+
             bad_epochs = 0
         else:
             bad_epochs += 1
@@ -1007,6 +970,7 @@ def run_single_fold(slices_root="./slices", val_fold=1, folds=5, epochs=EPOCHS, 
     result_dir = os.path.join("result", f"fold{val_fold}")
     stamp = time.strftime('%Y%m%d_%H%M%S');
     log_path = os.path.join(result_dir, f"console_{stamp}.log")
+    os.makedirs(result_dir, exist_ok=True)
     print(f"\n========== Single Run（验证=Fold {val_fold} nonoverlap；训练=其余折 overlap）==========")
     for td in train_dirs: print("  -", td)
     print("Val:", val_dir);

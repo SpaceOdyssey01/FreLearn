@@ -1,8 +1,10 @@
 from config import *
+from wt_utils import *
+from ae import*
+from torch.utils.data import ConcatDataset as Concat
 # ================== 工具：AUG/阈值相关 ==================
 def set_aug_strength_for_train_dataset(ds, s: float):
-    from torch.utils.data import ConcatDataset as _Concat
-    if isinstance(ds, _Concat):
+    if isinstance(ds, Concat):
         for sub in ds.datasets:
             if hasattr(sub, "set_strength"): sub.set_strength(s)
     else:
@@ -10,15 +12,15 @@ def set_aug_strength_for_train_dataset(ds, s: float):
 
 
 def set_class_strength_for_train_dataset(ds, mapping: dict):
-    from torch.utils.data import ConcatDataset as _Concat
-    if isinstance(ds, _Concat):
+    
+    if isinstance(ds, Concat):
         for sub in ds.datasets:
             if hasattr(sub, "set_class_strength"): sub.set_class_strength(mapping)
     else:
         if hasattr(ds, "set_class_strength"): ds.set_class_strength(mapping)
 
 
-def _batch_fnr(probs_pos: torch.Tensor, labels: torch.Tensor, thr: float = 0.5) -> float:
+def batch_fnr(probs_pos: torch.Tensor, labels: torch.Tensor, thr: float = 0.5) -> float:
     with torch.no_grad():
         pred = (probs_pos >= thr).long();
         y = labels.long()
@@ -29,7 +31,7 @@ def _batch_fnr(probs_pos: torch.Tensor, labels: torch.Tensor, thr: float = 0.5) 
         return fn / float(den)
 
 
-def _map_fnr_to_press(fnr_ema: float, low: float, high: float, tl: float, th: float) -> float:
+def map_fnr_to_press(fnr_ema: float, low: float, high: float, tl: float, th: float) -> float:
     if not (fnr_ema == fnr_ema): return tl
     if high <= low: return tl
     t = (fnr_ema - low) / (high - low);
@@ -147,9 +149,20 @@ class EEGFeatureDataset(Dataset):
                         state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
                         self.ae.load_state_dict(state, strict=True)
                         self.ae.eval()
-                        for p in self.ae.parameters(): p.requires_grad_(False)
-                        print(
-                            f"[EEGFeatureDataset] AE loaded from {self._ae_ckpt} (in_ch={self._ae_in_ch}, latent={self._ae_latent_ch})")
+                        for p in self.ae.parameters():
+                            p.requires_grad_(False)
+
+                        ckpt_abs = os.path.abspath(self._ae_ckpt)
+                        meta = []
+                        if isinstance(ckpt, dict):
+                            for k in ["epoch", "step", "best", "iter", "global_step"]:
+                                if k in ckpt:
+                                    meta.append(f"{k}={ckpt[k]}")
+                        n_params = sum(p.numel() for p in self.ae.parameters())
+                        meta_str = (" [" + ", ".join(meta) + "]") if meta else ""
+                        print(f"[AE] Loaded: {ckpt_abs}  "
+                            f"(in_ch={self._ae_in_ch}, latent={self._ae_latent_ch}, params={n_params/1e6:.2f}M){meta_str}")
+
                     except Exception as e:
                         raise RuntimeError(f"Load AE ckpt failed: {self._ae_ckpt} ({e})")
 
@@ -162,7 +175,7 @@ class EEGFeatureDataset(Dataset):
                     ex_enc = z.to("cpu")
                 else:
                     ex_enc = ex
-                ex_enc, _, _ = _pad_to_even(ex_enc)
+                ex_enc, _, _ = pad_to_even(ex_enc)
                 low, h_h, h_v, h_d = self._wav(ex_enc)
                 self._feat_shape = tuple(low.shape[1:])
 
@@ -322,7 +335,7 @@ class EEGFeatureDataset(Dataset):
         segs, labs = self._load_npz_file(file_idx)
         x = segs[local_idx].unsqueeze(0).float()  # [1,C,H,W]
         y = int(labs[local_idx].item())
-        x_raw_pad, _, _ = _pad_to_even(x)  # raw：pad 后原图
+        x_raw_pad, _, _ = pad_to_even(x)  # raw：pad 后原图
 
         # AE.encode 得到 z
         if self.use_ae_encoder and (self.ae is not None):
@@ -332,7 +345,7 @@ class EEGFeatureDataset(Dataset):
         else:
             x_enc = x
 
-        x_enc_pad, _, _ = _pad_to_even(x_enc)
+        x_enc_pad, _, _ = pad_to_even(x_enc)
         low, hh, hv, hd = self._wav(x_enc_pad)
         return low[0].clone(), hh[0].clone(), hv[0].clone(), hd[0].clone(), y, x_raw_pad[0].clone()
 
