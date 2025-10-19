@@ -664,6 +664,7 @@ def train(train_loader, val_loader, device):
             cls_loss = criterion(logits, y)
 
             cl_loss_total = W_CL1 * cl1 + W_CLM * clM + W_CL2 * cl2
+            cl_loss_total = CL_SCALE * cl_loss_total
             loss = W_CL * cl_loss_total + W_CLS * cls_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(classifier.parameters(), max_norm=5.0)
@@ -740,6 +741,7 @@ def train(train_loader, val_loader, device):
                     cls_loss = criterion(logits, y)
 
                     cl_loss_total = W_CL1 * cl1 + W_CLM * clM + W_CL2 * cl2
+                    cl_loss_total = CL_SCALE * cl_loss_total
                     loss = W_CL * cl_loss_total + W_CLS * cls_loss
 
                     bs = x.size(0)

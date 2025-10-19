@@ -41,3 +41,4 @@ W_CL1, W_CLM, W_CL2 = 1.0, 1.0, 1.0
 NUM_CLASSES = 2
 W_CL  = 0.5   # 对比学习总权重
 W_CLS = 1.0
+CL_SCALE = 0.02
