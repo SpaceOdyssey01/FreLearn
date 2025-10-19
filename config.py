@@ -11,6 +11,8 @@ from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score, co
 from pytorch_metric_learning.losses import NTXentLoss
 import argparse
 from pytorch_wavelets import DWTForward, DWTInverse
+import time
+from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score
 FOLD = 5
 DROPOUT = 0.5
 NOISE = 0
@@ -36,3 +38,6 @@ TARGET_HIGH = 1.1
 TARGET_LOW = 1.02
 SMOOTH = 0.5
 W_CL1, W_CLM, W_CL2 = 1.0, 1.0, 1.0
+NUM_CLASSES = 2
+W_CL  = 0.5   # 对比学习总权重
+W_CLS = 1.0

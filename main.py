@@ -24,12 +24,6 @@ class Resize2D(nn.Module):
             return F.interpolate(x, size=size, mode=self.mode, align_corners=False, antialias=self.antialias)
 
 
-
-
-
-
-
-# ================== 日志 ==================
 class MetricsLogger:
     def __init__(self, save_dir="result", csv_name="train_log.csv"):
         os.makedirs(save_dir, exist_ok=True);
@@ -113,7 +107,6 @@ class tee_stdout:
         return False
 
 
-# ================== 训练核心组件 ==================
 class EMA:
     def __init__(self, modules: dict, decay=0.999):
         self.decay = float(decay);
@@ -244,51 +237,81 @@ class CloBlock2D(nn.Module):
         y = self.drop(y)
         return shortcut + y
 
-
+# --- main.py: SimpleProjector 改造（新增 spatial_only 模式） ---
 class SimpleProjector(nn.Module):
     def __init__(self, in_channels, out_dim=128, patch=(16, 3), dropout=0.0,
-                 clo_depth=1, clo_heads=4, clo_window=7, clo_dw_kernel=3):
+                 clo_depth=1, clo_heads=3, clo_window=7, clo_dw_kernel=3,
+                 spatial_only=False):
         super().__init__()
-        self.out_dim = int(out_dim)
-        self.patch = tuple(patch)
         self.in_channels = int(in_channels)
+        self.spatial_only = bool(spatial_only)
         self.inorm = nn.InstanceNorm2d(in_channels, affine=True)
 
-        self.use_fuse = (self.in_channels > 1)
-        if self.use_fuse:
-            self.fuse_fc = nn.Linear(in_channels, in_channels, bias=False)
+        # 仅在非 spatial_only 下才启用“三导 softmax 融合 + 128通道语义路径”
+        self.use_fuse = (in_channels > 1) and (not self.spatial_only)
 
-        self.pre = nn.Sequential(
-            nn.Conv2d(in_channels if not self.use_fuse else 1, self.out_dim, kernel_size=1, bias=False),
-            nn.GroupNorm(8, self.out_dim),
-            nn.GELU(),
-            nn.Dropout2d(dropout),
-        )
-
-        self.clo = nn.Sequential(*[
-            CloBlock2D(self.out_dim, heads=clo_heads, dw_kernel=clo_dw_kernel,
-                       window=clo_window, drop=dropout)
-            for _ in range(max(1, int(clo_depth)))
-        ])
-
-        ph, pw = self.patch
-        self.patch_embed = nn.Conv2d(self.out_dim, self.out_dim,
-                                     kernel_size=(ph, pw), stride=(ph, pw),
-                                     padding=(ph // 2, pw // 2), bias=False)
-
-        self.vec_ln = nn.LayerNorm(self.out_dim)
-        self.vec_dp = nn.Dropout(dropout)
+        if self.spatial_only:
+            # C→C 的轻量预处理 + CloBlock 堆叠（保持通道不变）
+            self.pre = nn.Sequential(
+                nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False),
+                nn.GroupNorm(1, in_channels),
+                nn.GELU(),
+                nn.Dropout2d(dropout),
+            )
+            self.clo = nn.Sequential(*[
+                CloBlock2D(in_channels, heads=clo_heads,
+                           dw_kernel=clo_dw_kernel, window=clo_window,
+                           drop=dropout)
+                for _ in range(max(1, int(clo_depth)))
+            ])
+            # 可替换为 AvgPool2d/Conv(stride>1) 做 H/W 调整；这里默认不变
+            self.down = nn.Identity()
+        else:
+            # === 原有 128 通道语义路径（保持你的旧实现） ===
+            self.out_dim = int(out_dim)
+            self.patch = tuple(patch)
+            if self.use_fuse:
+                self.fuse_fc = nn.Linear(in_channels, in_channels, bias=False)
+            self.pre = nn.Sequential(
+                nn.Conv2d(in_channels if not self.use_fuse else 1, self.out_dim, kernel_size=1, bias=False),
+                nn.GroupNorm(8, self.out_dim), nn.GELU(), nn.Dropout2d(dropout),
+            )
+            self.clo = nn.Sequential(*[
+                CloBlock2D(self.out_dim, heads=clo_heads,
+                           dw_kernel=clo_dw_kernel, window=clo_window, drop=dropout)
+                for _ in range(max(1, int(clo_depth)))
+            ])
+            ph, pw = self.patch
+            self.patch_embed = nn.Conv2d(self.out_dim, self.out_dim,
+                                         kernel_size=(ph, pw), stride=(ph, pw),
+                                         padding=(ph // 2, pw // 2), bias=False)
+            self.vec_ln = nn.LayerNorm(self.out_dim)
+            self.vec_dp = nn.Dropout(dropout)
 
     def _fuse_channels(self, x):
-        if not self.use_fuse: return x
+        # 仅非 spatial_only 时才会被调用（保持你原实现）
         B, C, H, W = x.shape
         gap = x.mean(dim=(2, 3))
         w = F.softmax(self.fuse_fc(gap), dim=1).view(B, C, 1, 1)
         return (x * w).sum(dim=1, keepdim=True)
 
-    def forward(self, x, return_vec=True, return_feat=False):
+    def forward(self, x, return_vec=True, return_feat=False, subband_size=None):
         x = self.inorm(x)
-        x = self._fuse_channels(x) if self.use_fuse else x
+
+        if self.spatial_only:
+            # 图域路径：C=3 → C=3，只改 H/W 统计，不做3→1或C→128
+            x = self.pre(x)
+            x = self.clo(x)
+            x = self.down(x)                         # [B,3,H',W']
+            # 若需要精确对齐子带分辨率（H/2,W/2），可用 subband_size 指定
+            if (subband_size is not None) and (x.shape[-2:] != subband_size):
+                x = F.interpolate(x, size=subband_size, mode="bilinear", align_corners=False)
+            # spatial_only 返回“子带图”（供 iDWT 和 HLF）
+            return (x, x) if return_feat else x
+
+        # === 原 128 维语义路径（保留你的旧逻辑，以便回滚/消融） ===
+        if self.use_fuse:
+            x = self._fuse_channels(x)
         x = self.pre(x)
         x = self.clo(x)
         feat = self.patch_embed(x)
@@ -300,6 +323,7 @@ class SimpleProjector(nn.Module):
             return vec
         else:
             return feat
+
 
 
 class GatedMLP(nn.Module):
@@ -317,66 +341,85 @@ class GatedMLP(nn.Module):
         return self.drop(x)
 
 
-class FuseHL(nn.Module):
-
-    def __init__(self, dim=128, dropout=DROPOUT, use_residual=False):
+# --- main.py: 新增图域融合版的 stage 封装 ---
+class HighGateMap(nn.Module):
+    """从三张高频子带图（hh/hv/hd）计算 (B,3,1,1) 的样本级权重"""
+    def __init__(self, c_in=3, hidden=16):
         super().__init__()
-        # 注意：这里不再是 dim*2，而是 dim
-        self.alpha_head = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, dim // 2),
-            nn.ReLU(),
-            nn.Linear(dim // 2, 1),
-            nn.Sigmoid()
+        # 用全局均值（也可拼通道均值）做一个极轻的门控
+        self.mlp = nn.Sequential(
+            nn.Linear(3 * c_in, hidden), nn.GELU(),
+            nn.Linear(hidden, 3)
         )
-        self.post = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-        self.use_residual = use_residual
-        if use_residual:
-            self.residual = nn.Sequential(
-                nn.Linear(dim, dim),
-                nn.LayerNorm(dim),
-                nn.ReLU(),
-                nn.Dropout(dropout)
-            )
+    def forward(self, hh_map, hv_map, hd_map):
+        B, C, _, _ = hh_map.shape
+        s = torch.cat([hh_map.mean((2,3)), hv_map.mean((2,3)), hd_map.mean((2,3))], dim=1)  # [B, 3C]
+        w = F.softmax(self.mlp(s), dim=1).view(B, 3, 1, 1)                                   # [B,3,1,1]
+        return w
 
-    def forward(self, low_vec: torch.Tensor, high_vec: torch.Tensor, return_alpha: bool = False):
-
-        s = low_vec + high_vec  # [B, D]
-        alpha = self.alpha_head(s)  # [B, 1] in (0,1)
-
-        mix = (1.0 - alpha) * low_vec + alpha * high_vec
-        fused = self.post(mix)
-        if self.use_residual:
-            fused = fused + self.residual(s)
-        return (fused, alpha.squeeze(-1)) if return_alpha else fused
-
-
-class BandModulator(nn.Module):
-    def __init__(self, d_vec: int, c_in: int, scale: float = 0.25):
+class AlphaHL(nn.Module):
+    """从低/高融合候选图得到像素无关的 α（也可做通道相关）"""
+    def __init__(self, c_in=3, hidden=16):
         super().__init__()
-        self.to_low = nn.Linear(d_vec, c_in)
-        self.to_hh = nn.Linear(d_vec, c_in)
-        self.to_hv = nn.Linear(d_vec, c_in)
-        self.to_hd = nn.Linear(d_vec, c_in)
-        self.scale = float(scale)
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * c_in, hidden), nn.GELU(),
+            nn.Linear(hidden, c_in), nn.Sigmoid()
+        )
+    def forward(self, low_map, high_map):
+        s = torch.cat([low_map.mean((2,3)), high_map.mean((2,3))], dim=1)  # [B, 2C]
+        alpha = self.mlp(s).view(-1, low_map.size(1), 1, 1)                # [B,C,1,1] in (0,1)
+        return alpha
 
-    def forward(self, fused: torch.Tensor, yl: torch.Tensor, hh: torch.Tensor, hv: torch.Tensor, hd: torch.Tensor):
-        B, C, _, _ = yl.shape
+def stage_spatial_fusion_iwt(
+        x_in: torch.Tensor, wt: WaveletTransform,
+        conv_low: nn.Module, conv_hh: nn.Module, conv_hv: nn.Module, conv_hd: nn.Module,
+        high_gate_map: nn.Module, alpha_hl: nn.Module,
+        hlf_seq_loss: nn.Module,
+        resfuser: nn.Module,
+        resizer: nn.Module|None = None,
+        scale: float|None = None
+):
+    H0, W0 = x_in.shape[-2], x_in.shape[-1]
+    x_b, ph, pw = pad_to_even(x_in)
 
-        def _gain(linear):
-            g = linear(fused).view(B, C, 1, 1)
-            return 1.0 + self.scale * torch.tanh(g)
+    # WT
+    low, hh, hv, hd = wt(x_b)  # [B,3,H/2,W/2] ×4
 
-        yl_m = yl * _gain(self.to_low)
-        hh_m = hh * _gain(self.to_hh)
-        hv_m = hv * _gain(self.to_hv)
-        hd_m = hd * _gain(self.to_hd)
-        return yl_m, hh_m, hv_m, hd_m
+    # 四个 projector（spatial_only=True）：返回子带图 & feat（给 HLF）
+    low_map, feat_low = conv_low(low, return_feat=True, subband_size=low.shape[-2:])
+    hh_map,  feat_hh  = conv_hh(hh,  return_feat=True, subband_size=hh.shape[-2:])
+    hv_map,  feat_hv  = conv_hv(hv,  return_feat=True, subband_size=hv.shape[-2:])
+    hd_map,  feat_hd  = conv_hd(hd,  return_feat=True, subband_size=hd.shape[-2:])
+
+    # HLF 关系对比（3通道即可）
+    cl_loss = hlf_seq_loss(feat_hh.float(), feat_hv.float(), feat_hd.float(), feat_low.float())
+
+    # 高频三路样本级门控合成：仍是图域 [B,3,H/2,W/2]
+    w3 = high_gate_map(hh_map, hv_map, hd_map)                   # [B,3,1,1]
+    high_stack = torch.stack([hh_map, hv_map, hd_map], dim=1)    # [B,3,3,H/2,W/2]
+    high_map = (high_stack * w3.unsqueeze(2)).sum(dim=1)         # [B,3,H/2,W/2]
+
+    # 低-高图域 α 融合
+    alpha = alpha_hl(low_map, high_map)                          # [B,3,1,1]
+    low_f = (1.0 - alpha) * low_map + alpha * high_map           # [B,3,H/2,W/2]
+    hh_f, hv_f, hd_f = hh_map, hv_map, hd_map                    # 也可各自做 α 与 low_map 融合
+
+    # iDWT 重建到输入分辨率
+    x_rec = wt.inverse(low_f, hh_f, hv_f, hd_f)
+    if (ph or pw): x_rec = x_rec[..., :H0, :W0]
+
+    # 可选：按比例缩放后再做残差融合
+    if (scale is not None) and (scale < 1.0):
+        if resizer is None: resizer = Resize2D(mode="area")
+        Ht, Wt = max(1, int(H0 * scale)), max(1, int(W0 * scale))
+        x_in_s  = resizer(x_in,  size=(Ht, Wt))
+        x_rec_s = resizer(x_rec, size=(Ht, Wt))
+        x_out = resfuser(low_map.mean((2,3)), x_in_s, x_rec_s)  # 残差比例也可由 low_map 均值代替 fused 向量
+    else:
+        x_out = resfuser(low_map.mean((2,3)), x_in, x_rec)      # 仍用 ResidualFuseMap；其 beta 输入换成低频统计
+
+    return x_out, cl_loss
+
 
 
 class ResidualFuseMap(nn.Module):
@@ -405,15 +448,14 @@ class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
         cosf = 0.5 * (1 + math.cos(math.pi * t))
         return [base_lr * (self.min_factor + (1 - self.min_factor) * cosf) for base_lr in self.base_lrs]
 
-
-class ClassifierHead(nn.Module):
-    def __init__(self, in_dim, num_classes, dropout=DROPOUT):
+class ClassifierFrom3(nn.Module):
+    def __init__(self, num_classes, hidden=32, dropout=DROPOUT):
         super().__init__()
-        self.classifier = nn.Sequential(nn.Linear(in_dim, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout),
-                                        nn.Linear(256, num_classes))
-
-    def forward(self, x): return self.classifier(x)
-
+        self.net = nn.Sequential(
+            nn.Linear(3, hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden, num_classes)
+        )
+    def forward(self, x): return self.net(x)
 
 def param_groups(module):
     decay, no_decay = [], []
@@ -482,492 +524,305 @@ def stage_proj_contrast_mod_resfuse(
         x_out = resfuser(fused, x_in, x_recon)
 
     return fused, x_out, cl_loss
+def train(train_loader, val_loader, device):
+   
+    wt_runtime = WaveletTransform(wave="coif1", device=device.type).to(device)
 
+    def _mk_proj():
+        # 关键：clo_heads=3，确保 3 % 3 == 0
+        return SimpleProjector(
+            in_channels=3, spatial_only=True,
+            clo_depth=1, clo_heads=3, clo_dw_kernel=3, clo_window=7
+        ).to(device)
 
-def train(train_feature_path, val_feature_path, num_classes=2, epochs=100, batch_size=64, result_dir="result",
-          use_ae_encoder=True, ae_ckpt="./ae_ckpts/ae_best.pth", ae_in_ch=3, ae_latent_ch=3, ae_device="cpu"):
-    os.makedirs(result_dir, exist_ok=True)
+    # 四个子带 × 三个 stage
+    conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1 = _mk_proj(), _mk_proj(), _mk_proj(), _mk_proj()
+    conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M = _mk_proj(), _mk_proj(), _mk_proj(), _mk_proj()
+    conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2 = _mk_proj(), _mk_proj(), _mk_proj(), _mk_proj()
 
-    if isinstance(train_feature_path, (list, tuple)):
-        train_datasets = [EEGFeatureDataset(p, augment=True, noise_factor=NOISE,
-                                            wave_name="coif1", wt_device="cpu",
-                                            use_ae_encoder=use_ae_encoder, ae_ckpt=ae_ckpt,
-                                            ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch, ae_device=ae_device)
-                          for p in train_feature_path]
-        train_set = ConcatDataset(train_datasets);
-        y_train = torch.cat([ds.labels.clone().long() for ds in train_datasets], dim=0)
-        C, H, W = train_datasets[0].feature_shape
-    else:
-        train_set = EEGFeatureDataset(train_feature_path, augment=True, noise_factor=NOISE,
-                                      wave_name="coif1", wt_device="cpu",
-                                      use_ae_encoder=use_ae_encoder, ae_ckpt=ae_ckpt,
-                                      ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch, ae_device=ae_device)
-        y_train = train_set.labels.clone().long();
-        C, H, W = train_set.feature_shape
+    high_gate_map = HighGateMap(c_in=3).to(device)
+    alpha_hl      = AlphaHL(c_in=3).to(device)
+    resfuser      = ResidualFuseMap(d_vec=3).to(device)
+    classifier    = ClassifierFrom3(num_classes=NUM_CLASSES, hidden=32, dropout=DROPOUT).to(device)
 
-    val_set = EEGFeatureDataset(val_feature_path, augment=False,
-                                wave_name="coif1", wt_device="cpu",
-                                use_ae_encoder=use_ae_encoder, ae_ckpt=ae_ckpt,
-                                ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch, ae_device=ae_device)
-    vC, vH, vW = val_set.feature_shape
-    if (vC, vH, vW) != (C, H, W): raise ValueError(f"Train feature {(C, H, W)} != Val feature {(vC, vH, vW)}")
-    print(f"[INFO] Feature shape: C={C}, H={H}, W={W}")
+    hlf_seq_loss1 = HLF_RelationLoss_BP(temperature=0.15, pool_hw=(4,4), proj_hidden=64, proj_out=32, p_drop=0.2).to(device)
+    hlf_seq_lossM = HLF_RelationLoss_BP(temperature=0.15, pool_hw=(4,4), proj_hidden=64, proj_out=32, p_drop=0.2).to(device)
+    hlf_seq_loss2 = HLF_RelationLoss_BP(temperature=0.15, pool_hw=(4,4), proj_hidden=64, proj_out=32, p_drop=0.2).to(device)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger = MetricsLogger(save_dir=result_dir, csv_name="train_log.csv")
-    print(f"使用设备: {device}")
+    # ===== 优化器、调度器、EMA =====
+    def _pg(m):
+        return [{"params": [p for p in m.parameters() if p.requires_grad], "weight_decay": WEIGHT_DECAY}]
+    optim_params = []
+    def _add(m, lr):
+        for g in _pg(m):
+            g["lr"] = lr; optim_params.append(g)
 
-    num_classes = int(y_train.max().item() + 1)
-    class_count = torch.bincount(y_train, minlength=num_classes).float()
-    sample_weights = (1.0 / (class_count + 1e-6))[y_train]
-    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
-    train_loader = DataLoader(train_set, batch_size=batch_size, sampler=sampler, num_workers=0, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True, drop_last=False)
-    train_prior = (torch.bincount(y_train, minlength=num_classes).float());
-    train_prior = (train_prior / train_prior.sum()).to('cpu')
-    set_class_strength_for_train_dataset(train_set, {0: 1.0, 1: 1.2})
+    for m in [conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
+              conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
+              conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2]:
+        _add(m, BACKBONE_LR)
+    for m in [high_gate_map, alpha_hl, resfuser, classifier,
+              hlf_seq_loss1, hlf_seq_lossM, hlf_seq_loss2]:
+        _add(m, HEAD_LR)
 
-    # ----- 模型 -----
-    conv_low_1  = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
-    conv_hh_1   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
-    conv_hv_1   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
-    conv_hd_1   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
-
-    # Stage-M projectors
-    conv_low_M  = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
-    conv_hh_M   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
-    conv_hv_M   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
-    conv_hd_M   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
-
-    # Stage-2 projectors
-    conv_low_2  = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
-    conv_hh_2   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
-    conv_hv_2   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
-    conv_hd_2   = SimpleProjector(in_channels=C, out_dim=128, patch=(16,3), dropout=DROPOUT).to(device)
-
-    # 下面这些仍共享
-    high_gate = nn.Sequential(nn.LayerNorm(128), nn.Linear(128, 64), nn.GELU(), nn.Linear(64, 1)).to(device)
-    hl_fuse   = FuseHL(dim=128, dropout=DROPOUT).to(device)
-    classifier= ClassifierHead(in_dim=128, num_classes=num_classes, dropout=DROPOUT).to(device)
-
-    hlf_seq_loss1 = HLF_RelationLoss_BP(
-        temperature=0.15, pool_hw=(4, 4),
-        w_hh_low=1.0, w_hv_low=1.0, w_hd_low=1.0,
-        proj_hidden=256, proj_out=128, p_drop=0.2
-    ).to(device)
-
-    hlf_seq_lossM = HLF_RelationLoss_BP(
-        temperature=0.15, pool_hw=(4, 4),
-        w_hh_low=1.0, w_hv_low=1.0, w_hd_low=1.0,
-        proj_hidden=256, proj_out=128, p_drop=0.2
-    ).to(device)
-
-    hlf_seq_loss2 = HLF_RelationLoss_BP(
-        temperature=0.15, pool_hw=(4, 4),
-        w_hh_low=1.0, w_hv_low=1.0, w_hd_low=1.0,
-        proj_hidden=256, proj_out=128, p_drop=0.2
-    ).to(device)
-
-    wt_runtime = WaveletTransform(wave="coif1", device=device.type)  # 和模型同设备
-    modulator = BandModulator(d_vec=128, c_in=C, scale=0.25).to(device)
-    resfuser = ResidualFuseMap(d_vec=128).to(device)
-    # === 新增：全局复用的缩放器 ===
-    resizer = Resize2D(mode="area")
-
-    with torch.no_grad():
-        pos = float((y_train == 1).sum().item());
-        neg = float((y_train == 0).sum().item())
-        p = max(1e-6, pos / max(1.0, (pos + neg)));
-        prior_bias = math.log(p / (1.0 - p))
-        final_linear = classifier.classifier[-1]
-        in_dim_rel = 128 + 4 * 4  # 关系向量维
-        for _hlf in (hlf_seq_loss1, hlf_seq_lossM, hlf_seq_loss2):
-            _hlf._ensure_projector(in_dim=in_dim_rel, device=device)
-            _ = _hlf.proj(torch.randn(2, in_dim_rel, device=device))
-        if isinstance(final_linear, nn.Linear) and final_linear.bias is not None and final_linear.out_features == 2:
-            final_linear.bias.data[1] += prior_bias / 2.0;
-            final_linear.bias.data[0] -= prior_bias / 2.0
+    optimizer = torch.optim.AdamW(optim_params)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=10
+    )
 
     ema_modules = {
-        # Stage-1
         "low1": conv_low_1, "hh1": conv_hh_1, "hv1": conv_hv_1, "hd1": conv_hd_1,
-        # Stage-M
         "lowM": conv_low_M, "hhM": conv_hh_M, "hvM": conv_hv_M, "hdM": conv_hd_M,
-        # Stage-2
         "low2": conv_low_2, "hh2": conv_hh_2, "hv2": conv_hv_2, "hd2": conv_hd_2,
         "hlf1": hlf_seq_loss1, "hlfM": hlf_seq_lossM, "hlf2": hlf_seq_loss2,
-        # shared
-        "hlfuse": hl_fuse, "cls": classifier, "high_gate": high_gate,
-        "mod": modulator, "resf": resfuser
+        "gate": high_gate_map, "alpha": alpha_hl, "cls": classifier, "resf": resfuser
     }
     ema = EMA(ema_modules, decay=EMA_DECAY)
 
-    # ----- 优化器 -----
-    optim_params = []
+    # ===== 损失（统一用 CE；NUM_CLASSES=2 时更稳） =====
+    criterion = nn.CrossEntropyLoss().to(device)
+    def _prep_y(y): return y.long()
 
-    def add_module(m, lr):
-        for g in param_groups(m):
-            g["lr"] = lr
-            optim_params.append(g)
+    # ---- 辅助：在验证集上搜阈值（最大化 Balanced Accuracy）----
+    import numpy as np
+    from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score, confusion_matrix
 
-    for m in [conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
-          conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
-          conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2]:
-        add_module(m, BACKBONE_LR)
-    for m in [high_gate, hl_fuse, classifier, hlf_seq_loss1, hlf_seq_loss2,hlf_seq_lossM,modulator, resfuser]:
-        add_module(m, HEAD_LR)
-    optimizer = torch.optim.AdamW(optim_params)
-    scheduler = WarmupCosineLR(optimizer, warmup_epochs=5, max_epochs=epochs, min_factor=0.08)
+    def _search_best_thr(y_true_np, y_prob_np):
+        best_thr, best_bal, best_f1, best_acc, best_pos = 0.5, 0.0, 0.0, 0.0, 0.0
+        for thr in np.linspace(0.0, 1.0, 101):
+            pred = (y_prob_np >= thr).astype(int)
+            bal  = balanced_accuracy_score(y_true_np, pred)
+            f1   = f1_score(y_true_np, pred, zero_division=0)
+            acc  = (pred == y_true_np).mean()
+            posr = pred.mean()
+            if bal > best_bal:
+                best_bal, best_thr, best_f1, best_acc, best_pos = bal, thr, f1, acc, posr
+        return best_thr, best_bal, best_f1, best_acc, best_pos
 
-    # ----- 训练循环 -----
-    use_amp = (device.type == 'cuda');
-    scaler = GradScaler('cuda', enabled=use_amp)
-    best_val_metric = 0.0;
-    best_epoch = -1;
-    best_thr_to_save = 0.5
-    best_pack = {"val_acc": 0.0, "bal_acc": 0.0, "f1": 0.0, "auc": float('nan')}
-    bad_epochs = 0;
-    fnr_ema = None;
-    press_ema = TARGET_LOW;
-    train_thr = 0.5
+    # ===== 训练循环 =====
+    best_val = -1.0
+    best_pack = {"balacc": 0.0, "f1": 0.0, "auc": 0.5, "epoch": 0, "thr": 0.5}
 
-    print("开始训练...");
-    print("=" * 100)
-    for epoch in range(epochs):
-        s_epoch = aug_strength_schedule(epoch, epochs, s_max=1.0, s_min=0.6)
-        set_aug_strength_for_train_dataset(train_loader.dataset, s_epoch)
-        print(f"[AUG] strength = {s_epoch:.2f}")
-        warm_ratio, decay_ratio, T = 0.40, 0.15, epochs
-        if epoch < 5:
-            W_CLS, W_CL = 1.5, 0.0
-        else:
-            t = min(1.0, max(0.0, (epoch - 5) / max(1, warm_ratio * T - 5)))
-            wcl = 1.0 * 0.6 * (1 - math.cos(math.pi * t)) * 0.5
-            if epoch >= (1.0 - decay_ratio) * T:
-                s = (epoch - (1.0 - decay_ratio) * T) / (decay_ratio * T);
-                wcl = wcl * (1 - 0.5 * s)
-            W_CLS, W_CL = 1.5, wcl
+    for epoch in range(1, EPOCHS + 1):
+        tic = time.time()
 
+        # ---- train mode ----
         for m in [conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
-          conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
-          conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
-          high_gate, hl_fuse, classifier, hlf_seq_loss1, hlf_seq_loss2,hlf_seq_lossM,modulator, resfuser]:
+                  conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
+                  conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
+                  high_gate_map, alpha_hl, resfuser, classifier,
+                  hlf_seq_loss1, hlf_seq_lossM, hlf_seq_loss2]:
             m.train()
-        total_cl, total_cls, total_bal = 0.0, 0.0, 0.0;
-        correct = 0;
-        total = 0;
-        pos_cnt = 0
 
-        for it, batch in enumerate(train_loader):
-            low = batch['low'].to(device, non_blocking=True)
-            hh = batch['high_h'].to(device, non_blocking=True)
-            hv = batch['high_v'].to(device, non_blocking=True)
-            hd = batch['high_d'].to(device, non_blocking=True)
-            y = batch['label'].to(device, non_blocking=True)
-            raw = batch.get('raw', None)
-            if raw is not None: raw = raw.to(device, non_blocking=True)
+        # 训练/验证累计器
+        total, total_cl, total_cls = 0, 0.0, 0.0
 
-            with autocast('cuda', enabled=use_amp):
-                # ---------- Stage-1：统一用封装函数（按 STAGE1_SCALE 缩放） ----------
-                # 如果有原始图 raw（npz 模式），直接用 raw；否则用当前子带的 iDWT 重建作为输入图
-                x0 = raw if raw is not None else wt_runtime.inverse(low, hh, hv, hd).to(device)
-                fused1, y0, cl_loss1 = stage_proj_contrast_mod_resfuse(
-                    x_in=x0, wt=wt_runtime,
-                    conv_low=conv_low_1, conv_hh=conv_hh_1, conv_hv=conv_hv_1, conv_hd=conv_hd_1,
-                    high_gate=high_gate, hl_fuse=hl_fuse,
-                    modulator=modulator, resfuser=resfuser,
-                    hlf_seq_loss=hlf_seq_loss1, use_amp=use_amp,
-                    scale=STAGE1_SCALE, resizer=resizer
-                )
+        y_prob_all, y_true_all = [], []
+        train_loss, n_train = 0.0, 0
 
-                # ---------- Stage-M：再次 projector→对比→融合→调制→iDWT→残差（按 STAGEM_SCALE） ----------
-                fusedM, y1, cl_lossM = stage_proj_contrast_mod_resfuse(
-                    x_in=y0, wt=wt_runtime,
-                    conv_low=conv_low_M, conv_hh=conv_hh_M, conv_hv=conv_hv_M, conv_hd=conv_hd_M,
-                    high_gate=high_gate, hl_fuse=hl_fuse,
-                    modulator=modulator, resfuser=resfuser,
-                    hlf_seq_loss=hlf_seq_lossM, use_amp=use_amp,
-                    scale=STAGEM_SCALE, resizer=resizer
-                )
-
-                # ---------- Stage-2：对 y1 再做一轮 WT→投影→对比→融合→分类 ----------
-                y1_b, _, _ = pad_to_even(y1)
-                low2, hh2, hv2, hd2 = wt_runtime(y1_b)
-
-                vec_low2, feat_low2 = conv_low_2(low2.float(), return_vec=True, return_feat=True)
-                vec_hh2,  feat_hh2  = conv_hh_2(hh2.float(), return_vec=True, return_feat=True)
-                vec_hv2,  feat_hv2  = conv_hv_2(hv2.float(), return_vec=True, return_feat=True)
-                vec_hd2,  feat_hd2  = conv_hd_2(hd2.float(), return_vec=True, return_feat=True)
-                cl_loss2 = hlf_seq_loss2(feat_hh2.float(), feat_hv2.float(), feat_hd2.float(), feat_low2.float())
-
-                three2 = torch.stack([vec_hh2, vec_hv2, vec_hd2], dim=1)
-                gate3_2 = torch.softmax(high_gate(three2), dim=1)
-                high_vec2 = (three2 * gate3_2).sum(dim=1)
-                fused2, alpha_hl2 = hl_fuse(vec_low2, high_vec2, return_alpha=True)
-
-                if epoch == 0 and it == 0:
-                    try:
-                        print("[SHAPE] Stage-1:  x0:", tuple(x0.shape),
-                            "  y0(out):", tuple(y0.shape),
-                            "  fused1(vec):", tuple(fused1.shape))
-                        print("[SHAPE] Stage-M:  in(y0):", tuple(y0.shape),
-                            "  y1(out):", tuple(y1.shape),
-                            "  fusedM(vec):", tuple(fusedM.shape))
-                        print("[SHAPE] Stage-2 WT:",
-                            " low2:", tuple(low2.shape),
-                            " hh2:", tuple(hh2.shape),
-                            " hv2:", tuple(hv2.shape),
-                            " hd2:", tuple(hd2.shape))
-                    except Exception as _e:
-                        # 打印失败也不影响训练
-                        pass
-
-                # --- mixup 与分类 ---
-                press_t = torch.tensor([1.0, press_ema], device=fused2.device).detach()
-                MIXUP_STOP = int(MIXUP_STOP_FR * epochs)
-                if MIXUP_ALPHA > 0 and epoch < MIXUP_STOP:
-                    lam = np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA)
-                    perm = torch.randperm(y.size(0), device=y.device)
-                    fused_mix = lam * fused2 + (1 - lam) * fused2[perm]
-                    logits_train = classifier(fused_mix)
-                    y_one = F.one_hot(y, num_classes=logits_train.size(1)).float()
-                    soft = lam * y_one + (1 - lam) * y_one[perm]
-                    soft = soft * press_t;
-                    soft = soft / soft.sum(dim=1, keepdim=True).clamp_min(1e-8)
-                    cls_loss = F.kl_div(F.log_softmax(logits_train, dim=1), soft, reduction='batchmean')
-                    with torch.no_grad():
-                        was = classifier.training;
-                        classifier.eval()
-                        logits_clean = classifier(fused2);
-                        if was: classifier.train()
-                else:
-                    logits_train = classifier(fused2)
-                    ce = F.cross_entropy(logits_train, y, reduction='none', label_smoothing=0.02)
-                    w = torch.where(y == 1, torch.full_like(ce, press_ema), torch.ones_like(ce))
-                    cls_loss = (ce * w).mean()
-                    logits_clean = logits_train
-
-                # --- 其它正则 ---
-                with torch.no_grad():
-                    probs_clean = F.softmax(logits_clean, dim=1)[:, 1]
-                    fnr_cur = batch_fnr(probs_clean, y, thr=train_thr)
-                    if fnr_cur == fnr_cur:
-                        fnr_ema = fnr_cur if (fnr_ema is None) else (SMOOTH * fnr_ema + (1.0 - SMOOTH) * fnr_cur)
-                    press_cur = map_fnr_to_press(fnr_ema if fnr_ema is not None else 0.0, LOW, HIGH, TARGET_LOW,
-                                                  TARGET_HIGH)
-                    press_ema = SMOOTH * press_ema + (1.0 - SMOOTH) * press_cur
-
-                prob_bal = PROB_BAL_W * prob_balance_loss_from_logits(logits_train,
-                                                                      target_prior=train_prior.to(logits_train.device))
-                u3 = torch.full_like(gate3_2.mean(0), 1 / 3);
-                gate_reg = GATE_REG_W * F.kl_div(gate3_2.mean(0).clamp_min(1e-8).log(), u3, reduction='sum')
-                bal_loss = BALANCE_LOSS_W * (logits_train.mean(dim=0) ** 2).sum()
-
-                cl_loss_total = W_CL1 * cl_loss1 + W_CLM * cl_lossM + W_CL2 * cl_loss2
-
-                loss = (W_CL * cl_loss_total) + (W_CLS * cls_loss) + bal_loss + prob_bal + gate_reg
-                if not torch.isfinite(loss):
-                    # 跳过这个 batch，避免污染权重
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
+        for batch in train_loader:
+            x = batch["raw"].to(device).float()       # [B,3,H,W]
+            y = _prep_y(batch["label"].to(device))    # [B]
 
             optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                list(conv_low_1.parameters()) + list(conv_hh_1.parameters()) +
-                list(conv_hv_1.parameters()) + list(conv_hd_1.parameters()) +
-                list(conv_low_M.parameters()) + list(conv_hh_M.parameters()) +
-                list(conv_hv_M.parameters()) + list(conv_hd_M.parameters()) +
-                list(conv_low_2.parameters()) + list(conv_hh_2.parameters()) +
-                list(conv_hv_2.parameters()) + list(conv_hd_2.parameters()) +
-                list(high_gate.parameters()) + list(hl_fuse.parameters()) +
-                list(classifier.parameters()) + list(hlf_seq_loss1.parameters()) +
-                list(hlf_seq_loss2.parameters()) +list(hlf_seq_lossM.parameters()) +
-                list(modulator.parameters()) + list(resfuser.parameters()),
-                max_norm=0.5
+
+            # Stage-1
+            y0, cl1 = stage_spatial_fusion_iwt(
+                x_in=x, wt=wt_runtime,
+                conv_low=conv_low_1, conv_hh=conv_hh_1, conv_hv=conv_hv_1, conv_hd=conv_hd_1,
+                high_gate_map=high_gate_map, alpha_hl=alpha_hl,
+                hlf_seq_loss=hlf_seq_loss1, resfuser=resfuser,
+                resizer=None, scale=STAGE1_SCALE
             )
-            scaler.step(optimizer);
-            scaler.update();
-            ema.update(ema_modules)
 
-            bs = y.size(0);
-            total_cl += cl_loss_total.item() * bs
+            # Stage-M
+            y1, clM = stage_spatial_fusion_iwt(
+                x_in=y0, wt=wt_runtime,
+                conv_low=conv_low_M, conv_hh=conv_hh_M, conv_hv=conv_hv_M, conv_hd=conv_hd_M,
+                high_gate_map=high_gate_map, alpha_hl=alpha_hl,
+                hlf_seq_loss=hlf_seq_lossM, resfuser=resfuser,
+                resizer=None, scale=STAGEM_SCALE
+            )
 
-            total_cls += cls_loss.item() * bs;
-            total_bal += bal_loss.item() * bs
-            pred = logits_clean.argmax(dim=1);
-            correct += (pred == y).sum().item();
-            pos_cnt += (pred == 1).sum().item();
-            total += bs
+            # Stage-2（分类）
+            y1_b, _, _ = pad_to_even(y1)
+            low2, hh2, hv2, hd2 = wt_runtime(y1_b)
+            low2_map, feat_low2 = conv_low_2(low2, return_feat=True, subband_size=low2.shape[-2:])
+            hh2_map,  feat_hh2  = conv_hh_2(hh2,  return_feat=True, subband_size=hh2.shape[-2:])
+            hv2_map,  feat_hv2  = conv_hv_2(hv2,  return_feat=True, subband_size=hv2.shape[-2:])
+            hd2_map,  feat_hd2  = conv_hd_2(hd2,  return_feat=True, subband_size=hd2.shape[-2:])
 
+            cl2 = hlf_seq_loss2(feat_hh2.float(), feat_hv2.float(), feat_hd2.float(), feat_low2.float())
+
+            w3_2   = high_gate_map(hh2_map, hv2_map, hd2_map)
+            high2  = (torch.stack([hh2_map, hv2_map, hd2_map], dim=1) * w3_2.unsqueeze(2)).sum(dim=1)
+            alpha2 = alpha_hl(low2_map, high2)
+            low2_f = (1.0 - alpha2) * low2_map + alpha2 * high2
+
+            vec2   = low2_f.mean(dim=(2,3))                 # [B,3]
+            logits = classifier(vec2)                       # [B,NUM_CLASSES]
+            cls_loss = criterion(logits, y)
+
+            cl_loss_total = W_CL1 * cl1 + W_CLM * clM + W_CL2 * cl2
+            loss = W_CL * cl_loss_total + W_CLS * cls_loss
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(classifier.parameters(), max_norm=5.0)
+            optimizer.step(); ema.update(ema_modules)
+
+            bs = x.size(0)
+            total      += bs
+            total_cl   += cl_loss_total.item() * bs
+            total_cls  += cls_loss.item() * bs
+
+            train_loss += loss.item() * bs; n_train += bs
+            with torch.no_grad():
+                prob1 = F.softmax(logits, dim=1)[:, 1]
+                y_prob_all.append(prob1.detach().cpu())
+                y_true_all.append(y.detach().cpu())
+
+        # 训练集监控（固定 thr=0.5）
+        train_loss /= max(1, n_train)
+        y_prob_all = torch.cat(y_prob_all).numpy()
+        y_true_all = torch.cat(y_true_all).numpy()
+        pred_tr = (y_prob_all >= 0.5).astype(int)
+        train_acc = float((pred_tr == y_true_all).mean() * 100.0)
+        train_pos_rate = float(pred_tr.mean() * 100.0)
+
+        # ---- eval mode ----
         for m in [conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
-          conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
-          conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
-          high_gate, hl_fuse, classifier, hlf_seq_loss1,hlf_seq_loss2,hlf_seq_lossM, modulator, resfuser]:
+                  conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
+                  conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
+                  high_gate_map, alpha_hl, resfuser, classifier,
+                  hlf_seq_loss1, hlf_seq_lossM, hlf_seq_loss2]:
             m.eval()
-        scheduler.step()
-        train_acc = 100.0 * correct / max(1, total);
-        train_pos_rate = pos_cnt / max(1, total)
-        lrs = [pg['lr'] for pg in optimizer.param_groups];
-        lr_min, lr_max = min(lrs), max(lrs)
 
-        # ----- 验证 -----
+        # 验证累计器
+        val_total, val_cl, val_cls = 0, 0.0, 0.0
+        y_prob_v, y_true_v = [], []
         with ema.apply(ema_modules):
             with torch.no_grad():
-                val_cl = val_cls = 0.0;
-                val_total = 0;
-                val_logits_list = [];
-                val_labels_list = []
                 for batch in val_loader:
-                    low = batch['low'].to(device);
-                    hh = batch['high_h'].to(device);
-                    hv = batch['high_v'].to(device);
-                    hd = batch['high_d'].to(device)
-                    y = batch['label'].to(device);
-                    raw = batch.get('raw', None)
-                    if raw is not None: raw = raw.to(device, non_blocking=True)
-                    with autocast('cuda', enabled=use_amp):
-                        # Stage-1（验证同样按 STAGE1_SCALE）
-                        x0 = raw if raw is not None else wt_runtime.inverse(low, hh, hv, hd).to(device)
-                        fused1, y0, cl_loss1 = stage_proj_contrast_mod_resfuse(
-                            x_in=x0, wt=wt_runtime,
-                            conv_low=conv_low_1, conv_hh=conv_hh_1, conv_hv=conv_hv_1, conv_hd=conv_hd_1,
-                            high_gate=high_gate, hl_fuse=hl_fuse,
-                            modulator=modulator, resfuser=resfuser,
-                            hlf_seq_loss=hlf_seq_loss1, use_amp=use_amp,
-                            scale=STAGE1_SCALE, resizer=resizer
-                        )
+                    x = batch["raw"].to(device).float()
+                    y = _prep_y(batch["label"].to(device))
 
-                        # Stage-M（验证同样按 STAGEM_SCALE）
-                        fusedM, y1, cl_lossM = stage_proj_contrast_mod_resfuse(
-                            x_in=y0, wt=wt_runtime,
-                            conv_low=conv_low_M, conv_hh=conv_hh_M, conv_hv=conv_hv_M, conv_hd=conv_hd_M,
-                            high_gate=high_gate, hl_fuse=hl_fuse,
-                            modulator=modulator, resfuser=resfuser,
-                            hlf_seq_loss=hlf_seq_lossM, use_amp=use_amp,
-                            scale=STAGEM_SCALE, resizer=resizer
-                        )
+                    # Stage-1
+                    y0, cl1 = stage_spatial_fusion_iwt(
+                        x_in=x, wt=wt_runtime,
+                        conv_low=conv_low_1, conv_hh=conv_hh_1, conv_hv=conv_hv_1, conv_hd=conv_hd_1,
+                        high_gate_map=high_gate_map, alpha_hl=alpha_hl,
+                        hlf_seq_loss=hlf_seq_loss1, resfuser=resfuser,
+                        resizer=None, scale=STAGE1_SCALE
+                    )
+                    # Stage-M
+                    y1, clM = stage_spatial_fusion_iwt(
+                        x_in=y0, wt=wt_runtime,
+                        conv_low=conv_low_M, conv_hh=conv_hh_M, conv_hv=conv_hv_M, conv_hd=conv_hd_M,
+                        high_gate_map=high_gate_map, alpha_hl=alpha_hl,
+                        hlf_seq_loss=hlf_seq_lossM, resfuser=resfuser,
+                        resizer=None, scale=STAGEM_SCALE
+                    )
+                    # Stage-2 + 分类
+                    y1_b, _, _ = pad_to_even(y1)
+                    low2, hh2, hv2, hd2 = wt_runtime(y1_b)
+                    low2_map, feat_low2 = conv_low_2(low2, return_feat=True, subband_size=low2.shape[-2:])
+                    hh2_map,  feat_hh2  = conv_hh_2(hh2,  return_feat=True, subband_size=hh2.shape[-2:])
+                    hv2_map,  feat_hv2  = conv_hv_2(hv2,  return_feat=True, subband_size=hv2.shape[-2:])
+                    hd2_map,  feat_hd2  = conv_hd_2(hd2,  return_feat=True, subband_size=hd2.shape[-2:])
+                    cl2 = hlf_seq_loss2(feat_hh2.float(), feat_hv2.float(), feat_hd2.float(), feat_low2.float())
 
-                        # Stage-2
-                        y1_b, _, _ = pad_to_even(y1)
-                        low2, hh2, hv2, hd2 = wt_runtime(y1_b)
+                    w3_2   = high_gate_map(hh2_map, hv2_map, hd2_map)
+                    high2  = (torch.stack([hh2_map, hv2_map, hd2_map], dim=1) * w3_2.unsqueeze(2)).sum(dim=1)
+                    alpha2 = alpha_hl(low2_map, high2)
+                    low2_f = (1.0 - alpha2) * low2_map + alpha2 * high2
 
+                    vec2   = low2_f.mean(dim=(2,3))
+                    logits = classifier(vec2)
+                    cls_loss = criterion(logits, y)
 
-                        vec_low2, feat_low2 = conv_low_2(low2.float(), return_vec=True, return_feat=True)
-                        vec_hh2,  feat_hh2  = conv_hh_2(hh2.float(), return_vec=True, return_feat=True)
-                        vec_hv2,  feat_hv2  = conv_hv_2(hv2.float(), return_vec=True, return_feat=True)
-                        vec_hd2,  feat_hd2  = conv_hd_2(hd2.float(), return_vec=True, return_feat=True)
-                        cl_loss2 = hlf_seq_loss2(feat_hh2, feat_hv2, feat_hd2, feat_low2)
-                        three2 = torch.stack([vec_hh2, vec_hv2, vec_hd2], dim=1)
-                        gate3_2 = torch.softmax(high_gate(three2), dim=1)
-                        high_vec2 = (three2 * gate3_2).sum(dim=1)
-                        fused2, _ = hl_fuse(vec_low2, high_vec2, return_alpha=True)
+                    cl_loss_total = W_CL1 * cl1 + W_CLM * clM + W_CL2 * cl2
+                    loss = W_CL * cl_loss_total + W_CLS * cls_loss
 
-                        logits = classifier(fused2);
-                        cls_loss = F.cross_entropy(logits, y)
-                        cl_loss = W_CL1*cl_loss1 + W_CLM*cl_lossM + W_CL2*cl_loss2
-                    bs = y.size(0);
-                    val_cl += cl_loss.item() * bs;
-                    val_cls += cls_loss.item() * bs;
+                    bs = x.size(0)
                     val_total += bs
-                    val_logits_list.append(logits.detach().cpu());
-                    val_labels_list.append(y.detach().cpu())
+                    val_cl    += cl_loss_total.item() * bs
+                    val_cls   += cls_loss.item() * bs
 
-        val_logits = torch.cat(val_logits_list, dim=0);
-        val_labels = torch.cat(val_labels_list, dim=0)
-        probs = F.softmax(val_logits, dim=1)[:, 1].numpy();
-        y_true = val_labels.numpy()
-        grid = np.linspace(0.05, 0.95, 19);
-        q = np.quantile(probs, np.linspace(0.05, 0.95, 19))
-        ths = np.unique(np.clip(np.concatenate([grid, q]), 1e-4, 1 - 1e-4))
-        best_bal, best_thr = 0.0, 0.5
-        for thr in ths:
-            pred = (probs >= thr).astype(int);
-            pos_rate = pred.mean()
-            if pos_rate < 0.10 or pos_rate > 0.90: continue
-            bal = balanced_accuracy_score(y_true, pred)
-            if bal > best_bal: best_bal, best_thr = bal, thr
-        pred_best = (probs >= best_thr).astype(int)
-        val_acc = (pred_best == y_true).mean() * 100.0;
-        bal_acc = best_bal;
-        f1 = f1_score(y_true, pred_best)
+                    prob1 = F.softmax(logits, dim=1)[:, 1]
+                    y_prob_v.append(prob1.detach().cpu())
+                    y_true_v.append(y.detach().cpu())
+
+        # 验证指标 + 阈值搜索
+        y_prob_v = torch.cat(y_prob_v).numpy()
+        y_true_v = torch.cat(y_true_v).numpy()
+
         try:
-            auc = roc_auc_score(y_true, probs)
-        except ValueError:
-            auc = float('nan')
-        cm = confusion_matrix(y_true, pred_best);
-        pos_rate_at_thr = float(pred_best.mean())
+            auc_v = roc_auc_score(y_true_v, y_prob_v)
+        except Exception:
+            auc_v = 0.5
 
-        metric = bal_acc * 100.0;
-        improved = metric > best_val_metric
-        if improved:
-            best_val_metric = metric;
-            best_epoch = epoch + 1;
-            best_thr_to_save = float(best_thr)
-            best_pack = {"val_acc": float(val_acc), "bal_acc": float(bal_acc * 100.0), "f1": float(f1),
-                         "auc": float(auc)}
-            torch.save({
-                # Stage-1
-                'conv_low_1': conv_low_1.state_dict(), 'conv_hh_1': conv_hh_1.state_dict(),
-                'conv_hv_1': conv_hv_1.state_dict(), 'conv_hd_1': conv_hd_1.state_dict(),
-                # Stage-M
-                'conv_low_M': conv_low_M.state_dict(), 'conv_hh_M': conv_hh_M.state_dict(),
-                'conv_hv_M': conv_hv_M.state_dict(), 'conv_hd_M': conv_hd_M.state_dict(),
-                # Stage-2
-                'conv_low_2': conv_low_2.state_dict(), 'conv_hh_2': conv_hh_2.state_dict(),
-                'conv_hv_2': conv_hv_2.state_dict(), 'conv_hd_2': conv_hd_2.state_dict(),
-                # shared
-                'high_gate': high_gate.state_dict(),
-                'hl_fuse': hl_fuse.state_dict(),
-                'classifier': classifier.state_dict(),
-                'modulator': modulator.state_dict(),
-                'resfuser': resfuser.state_dict(),
-                # 3个阶段的 HLF
-                'hlf_seq_loss1': hlf_seq_loss1.state_dict(),
-                'hlf_seq_lossM': hlf_seq_lossM.state_dict(),
-                'hlf_seq_loss2': hlf_seq_loss2.state_dict(),
-                # --- 元信息 / EMA ---
-                'epoch': epoch, 'best_thr': float(best_thr),
-                'best_metric_bal_acc': metric, 'val_acc_at_best': float(val_acc),
-                'val_f1_at_best': float(f1), 'val_auc_at_best': float(auc),
-                'ema_shadow': ema.shadow, 'ema_decay': EMA_DECAY,
-            }, os.path.join(result_dir, "best_model.pt"))
+        best_thr, balacc_v, f1_v, val_acc_frac, pos_rate_at_thr = _search_best_thr(y_true_v, y_prob_v)
+        val_acc = float(val_acc_frac * 100.0)
 
+        # 学习率区间
+        lr_list = [pg["lr"] for pg in optimizer.param_groups]
+        lr_min, lr_max = (min(lr_list), max(lr_list)) if lr_list else (0.0, 0.0)
 
-            bad_epochs = 0
-        else:
-            bad_epochs += 1
+        # 混淆矩阵（使用 thr*）
+        cm = confusion_matrix(y_true_v, (y_prob_v >= best_thr).astype(int))
 
-        print(f"Epoch {epoch + 1:3d}/{epochs}")
-        print(f"  Train: ConLoss={total_cl / max(1, total):.4f}, ClasLoss={total_cls / max(1, total):.4f}  "
+        # === 你要求的打印格式 ===
+        print(f"Epoch {epoch:3d}/{EPOCHS}")
+        print(f"  Train: ConLoss={total_cl/max(1,total):.4f}, ClasLoss={total_cls/max(1,total):.4f}  "
               f"Acc={train_acc:.2f}%  pos_rate={train_pos_rate:.2f}  (lr=[{lr_min:.2e}, {lr_max:.2e}])")
-        print(f"  Val:   ConLoss={val_cl / max(1, val_total):.4f}, ClasLoss={val_cls / max(1, val_total):.4f}, "
-              f"Acc={val_acc:.2f}%  BalAcc={bal_acc * 100:.2f}%  F1={f1:.3f}  AUC={auc:.3f}  thr*={best_thr:.2f}  pos_rate@thr*={pos_rate_at_thr:.2f}")
+        print(f"  Val:   ConLoss={val_cl/max(1,val_total):.4f}, ClasLoss={val_cls/max(1,val_total):.4f}, "
+              f"Acc={val_acc:.2f}%  BalAcc={balacc_v*100:.2f}%  F1={f1_v:.3f}  AUC={auc_v:.3f}  "
+              f"thr*={best_thr:.2f}  pos_rate@thr*={pos_rate_at_thr*100:.2f}")
         print(f"  CM:\n{cm}")
 
-        logger.log_epoch(epoch=epoch + 1, train_acc=train_acc, val_acc=val_acc, bal_acc=bal_acc, f1=f1,
-                         auc=auc if not (isinstance(auc, float) and (auc != auc)) else "",
-                         train_con_loss=total_cl / max(1, total), train_cls_loss=total_cls / max(1, total),
-                         val_con_loss=val_cl / max(1, val_total), val_cls_loss=val_cls / max(1, val_total),
-                         lr_min=lr_min, lr_max=lr_max, thr=best_thr, pos_rate_val=pos_rate_at_thr)
+        # 调度器与保存最优
+        scheduler.step(balacc_v)
+        if balacc_v > best_val:
+            best_val = balacc_v
+            best_pack = {"balacc": balacc_v, "f1": f1_v, "auc": auc_v, "epoch": epoch, "thr": float(best_thr)}
+            torch.save({
+                "conv_low_1": conv_low_1.state_dict(), "conv_hh_1": conv_hh_1.state_dict(),
+                "conv_hv_1": conv_hv_1.state_dict(),   "conv_hd_1": conv_hd_1.state_dict(),
+                "conv_low_M": conv_low_M.state_dict(), "conv_hh_M": conv_hh_M.state_dict(),
+                "conv_hv_M": conv_hv_M.state_dict(),   "conv_hd_M": conv_hd_M.state_dict(),
+                "conv_low_2": conv_low_2.state_dict(), "conv_hh_2": conv_hh_2.state_dict(),
+                "conv_hv_2": conv_hv_2.state_dict(),   "conv_hd_2": conv_hd_2.state_dict(),
+                "high_gate_map": high_gate_map.state_dict(),
+                "alpha_hl": alpha_hl.state_dict(),
+                "resfuser": resfuser.state_dict(),
+                "classifier": classifier.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "ema": ema.shadow
+            }, "best_ckpt_spatial_only.pth")
 
-        if bad_epochs >= PATIENCE:
-            print(
-                f"Early stop at epoch {epoch + 1}. Best BalAcc={best_val_metric:.2f}% @ epoch {best_epoch}, thr*={best_thr_to_save:.2f}")
-            break
-
-    print(f"[DONE] Best BalAcc={best_val_metric:.2f}% @ epoch {best_epoch}, thr*={best_thr_to_save:.2f}")
-    logger.plot_curves(save_dir=result_dir)
-    return {"best_bal_acc": best_val_metric, "best_epoch": best_epoch, "best_thr": best_thr_to_save, **best_pack}
+    # ===== 返回指标 =====
+    return {
+        "best_epoch": int(best_pack["epoch"]),
+        "best_bal_acc": float(best_pack["balacc"] * 100.0),
+        "val_acc": float(val_acc),               # 最后一个 epoch 的验证 Acc（如需 best-epoch 的，可一起存）
+        "f1": float(best_pack["f1"]),
+        "auc": float(best_pack["auc"]),
+        "best_thr": float(best_pack["thr"]),
+    }
 
 
 def run_single_fold(slices_root="./slices", val_fold=1, folds=5, epochs=EPOCHS, batch_size=64,
-                    use_ae_encoder=True, ae_ckpt="./ae_ckpts/ae_best.pth", ae_in_ch=3, ae_latent_ch=3, ae_device="cpu"):
+                    use_ae_encoder=True, ae_ckpt="./ae_ckpts/ae_best.pth",
+                    ae_in_ch=3, ae_latent_ch=3, ae_device="cpu"):
+    """把 overlap 折作为训练集，nonoverlap 折作为验证集；真正构造 DataLoader 再调用 train()。"""
+
     def has_npz(dir_):
         return os.path.isdir(dir_) and any(f.endswith(".npz") for f in os.listdir(dir_))
 
-    if not (1 <= int(val_fold) <= int(folds)): raise ValueError(f"--val_fold 必须在 1..{folds}，当前 {val_fold}")
+    if not (1 <= int(val_fold) <= int(folds)):
+        raise ValueError(f"--val_fold 必须在 1..{folds}，当前 {val_fold}")
+
+    # 训练折（overlap）
     train_dirs = []
     for j in range(1, folds + 1):
         if j == val_fold: continue
@@ -976,22 +831,49 @@ def run_single_fold(slices_root="./slices", val_fold=1, folds=5, epochs=EPOCHS, 
             train_dirs.append(d)
         else:
             print(f"[警告] 跳过不存在/无 .npz 的目录：{d}")
+
+    # 验证折（nonoverlap）
     val_dir = os.path.join(slices_root, f"fold{val_fold}_nonoverlap", "shards")
-    if not train_dirs: raise RuntimeError("没有可用训练分片（未发现 .npz）")
-    if not has_npz(val_dir): raise RuntimeError(f"验证目录无 .npz：{val_dir}")
+    if not train_dirs:
+        raise RuntimeError("没有可用训练分片（未发现 .npz）")
+    if not has_npz(val_dir):
+        raise RuntimeError(f"验证目录无 .npz：{val_dir}")
+
     result_dir = os.path.join("result", f"fold{val_fold}")
-    stamp = time.strftime('%Y%m%d_%H%M%S');
+    stamp = time.strftime('%Y%m%d_%H%M%S')
     log_path = os.path.join(result_dir, f"console_{stamp}.log")
     os.makedirs(result_dir, exist_ok=True)
     print(f"\n========== Single Run（验证=Fold {val_fold} nonoverlap；训练=其余折 overlap）==========")
     for td in train_dirs: print("  -", td)
-    print("Val:", val_dir);
+    print("Val:", val_dir)
     print(f"Result dir: {result_dir}")
+
+    # === 组装 DataLoader ===
+    device = torch.device("cuda" if (torch.cuda.is_available() and ae_device == "cuda") else "cpu")
+
+    train_datasets = [
+        EEGFeatureDataset(
+            feature_path=td, augment=True,
+            use_ae_encoder=use_ae_encoder, ae_ckpt=ae_ckpt,
+            ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch, ae_device=ae_device,
+            wave_name="coif1", wt_device=device.type
+        ) for td in train_dirs
+    ]
+    train_ds = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
+    val_ds = EEGFeatureDataset(
+        feature_path=val_dir, augment=False,
+        use_ae_encoder=use_ae_encoder, ae_ckpt=ae_ckpt,
+        ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch, ae_device=ae_device,
+        wave_name="coif1", wt_device=device.type
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=4, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+    # === 训练 ===
     with tee_stdout(log_path):
-        metrics = train(train_feature_path=train_dirs, val_feature_path=val_dir, num_classes=2, epochs=epochs,
-                        batch_size=batch_size, result_dir=result_dir,
-                        use_ae_encoder=use_ae_encoder, ae_ckpt=ae_ckpt, ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch,
-                        ae_device=ae_device)
+        metrics = train(train_loader=train_loader, val_loader=val_loader, device=device)
+
     print(f"[DONE] Fold {val_fold} 最优 BalAcc={metrics['best_bal_acc']:.2f}% (epoch {metrics['best_epoch']})，"
           f"Acc={metrics['val_acc']:.2f}%  F1={metrics['f1']:.3f}  AUC={metrics['auc']:.3f}  thr*={metrics['best_thr']:.2f}")
     print(f"控制台日志保存在：{log_path}")
