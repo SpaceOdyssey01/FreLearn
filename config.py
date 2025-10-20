@@ -16,21 +16,21 @@ from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score
 FOLD = 5
 DROPOUT = 0.5
 NOISE = 0
-EPOCHS = 150
-HEAD_LR = 6e-4
-BACKBONE_LR = 1.5e-4
+EPOCHS = 200
+HEAD_LR = 8e-4
+BACKBONE_LR = 2e-4
 WEIGHT_DECAY = 1e-5
 BALANCE_LOSS_W = 1e-3
-PATIENCE = 80
+PATIENCE = 180
 EMA_DECAY = 0.997
-STAGE1_SCALE = 0.9  # Stage-1 分数缩放（1.0 表示不缩）
+STAGE1_SCALE = 0.8 # Stage-1 分数缩放（1.0 表示不缩）
 STAGEM_SCALE = 0.8  # Stage-M 分数缩放
 
 PROB_BAL_W = 1e-2
 GATE_REG_W = 1e-3
 MIXUP_ALPHA = 0.4
 MIXUP_STOP_FR = 0.4
-SUBBAND_DROP_P = 0.05
+SUBBAND_DROP_P = 0
 
 HIGH = 0.35
 LOW = 0.25
