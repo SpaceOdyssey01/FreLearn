@@ -315,7 +315,6 @@ class EEGFeatureDataset(Dataset):
         hd = self.high_d[idx].clone()
         return low, hh, hv, hd, int(self.labels[idx].item()), None
 
-    # ====== .npz：先 AE.encode → 再 WT ======
     def _load_npz_file(self, file_idx):
         if file_idx in self._npz_cache:
             arr = self._npz_cache.pop(file_idx)
@@ -323,18 +322,23 @@ class EEGFeatureDataset(Dataset):
             return arr
         f = self._npz_files[file_idx]
         with np.load(f) as npz:
-            segs = torch.from_numpy(npz["segments"]).float()  # [N,C,H,W]
+            segs = torch.from_numpy(npz["segments"]).float()
             labs = torch.from_numpy(npz["labels"]).long()
-        self._npz_cache[file_idx] = (segs, labs)
+            sids = torch.from_numpy(npz["subjects"]).long() if ("subjects" in npz.files) else None
+        pack = {"segs": segs, "labs": labs, "sids": sids}
+        self._npz_cache[file_idx] = pack
         if len(self._npz_cache) > self._npz_cache_files:
             self._npz_cache.popitem(last=False)
-        return segs, labs
+        return pack   # ← 关键
+
 
     def _get_item_from_npz(self, idx):
         file_idx, local_idx = self._npz_index[idx]
-        segs, labs = self._load_npz_file(file_idx)
-        x = segs[local_idx].unsqueeze(0).float()  # [1,C,H,W]
+        pack = self._load_npz_file(file_idx)
+        segs, labs, sids = pack["segs"], pack["labs"], pack["sids"]
+        x = segs[local_idx].unsqueeze(0).float()
         y = int(labs[local_idx].item())
+        sid = int(sids[local_idx].item()) if (sids is not None) else -1
         x_raw_pad, _, _ = pad_to_even(x)  # raw：pad 后原图
 
         # AE.encode 得到 z
@@ -347,17 +351,20 @@ class EEGFeatureDataset(Dataset):
 
         x_enc_pad, _, _ = pad_to_even(x_enc)
         low, hh, hv, hd = self._wav(x_enc_pad)
-        return low[0].clone(), hh[0].clone(), hv[0].clone(), hd[0].clone(), y, x_raw_pad[0].clone()
+        return low[0].clone(), hh[0].clone(), hv[0].clone(), hd[0].clone(), y, x_raw_pad[0].clone(), sid
 
     def __getitem__(self, idx):
         if self.mode == 'pt_dir':
             low, hh, hv, hd, label, raw = self._get_item_from_shard(idx)
+            sid = -1
         elif self.mode == 'pt_single':
             low, hh, hv, hd, label, raw = self._get_item_from_single(idx)
+            sid = -1
         elif self.mode == 'npz_dir':
-            low, hh, hv, hd, label, raw = self._get_item_from_npz(idx)
+            low, hh, hv, hd, label, raw, sid = self._get_item_from_npz(idx)
         else:
             raise RuntimeError("Unknown dataset mode")
+
 
         if self.augment:
             def aug(x, y):
@@ -378,7 +385,11 @@ class EEGFeatureDataset(Dataset):
 
             low, hh, hv, hd = aug(low, label), aug(hh, label), aug(hv, label), aug(hd, label)
 
-        sample = {"low": low, "high_h": hh, "high_v": hv, "high_d": hd, "label": torch.tensor(label, dtype=torch.long)}
+        sample = {
+            "low": low, "high_h": hh, "high_v": hv, "high_d": hd,
+            "label": torch.tensor(label, dtype=torch.long),
+            "sid": torch.tensor(sid, dtype=torch.long)
+        }
         if raw is not None:
             sample["raw"] = raw
         return sample

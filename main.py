@@ -3,6 +3,8 @@ from ae import *
 from wt_utils import *
 from data import *
 from contrast import HLF_RelationLoss_BP
+import json
+from collections import defaultdict
 
 
 class Resize2D(nn.Module):
@@ -524,7 +526,7 @@ def stage_proj_contrast_mod_resfuse(
         x_out = resfuser(fused, x_in, x_recon)
 
     return fused, x_out, cl_loss
-def train(train_loader, val_loader, device):
+def train(train_loader, val_loader, device, val_fold):
    
     wt_runtime = WaveletTransform(wave="coif1", device=device.type).to(device)
 
@@ -553,6 +555,8 @@ def train(train_loader, val_loader, device):
     def _pg(m):
         return [{"params": [p for p in m.parameters() if p.requires_grad], "weight_decay": WEIGHT_DECAY}]
     optim_params = []
+    val_sids = []
+    val_labels_epoch = []
     def _add(m, lr):
         for g in _pg(m):
             g["lr"] = lr; optim_params.append(g)
@@ -589,7 +593,7 @@ def train(train_loader, val_loader, device):
 
     def _search_best_thr(y_true_np, y_prob_np):
         best_thr, best_bal, best_f1, best_acc, best_pos = 0.5, 0.0, 0.0, 0.0, 0.0
-        for thr in np.linspace(0.0, 1.0, 101):
+        for thr in np.linspace(0.2, 0.8, 101):
             pred = (y_prob_np >= thr).astype(int)
             bal  = balanced_accuracy_score(y_true_np, pred)
             f1   = f1_score(y_true_np, pred, zero_division=0)
@@ -700,6 +704,8 @@ def train(train_loader, val_loader, device):
         # 验证累计器
         val_total, val_cl, val_cls = 0, 0.0, 0.0
         y_prob_v, y_true_v = [], []
+        val_sids = []             # ← 每个 epoch 清空
+        val_labels_epoch = []     # ← 每个 epoch 清空
         with ema.apply(ema_modules):
             with torch.no_grad():
                 for batch in val_loader:
@@ -752,6 +758,12 @@ def train(train_loader, val_loader, device):
                     prob1 = F.softmax(logits, dim=1)[:, 1]
                     y_prob_v.append(prob1.detach().cpu())
                     y_true_v.append(y.detach().cpu())
+                    sid_b = batch.get("sid", None)
+                    if sid_b is None:
+                        # 兼容：如果数据集没返回 sid，就全部记 -1
+                        sid_b = torch.full_like(y, fill_value=-1)
+                    val_sids.append(sid_b.detach().cpu())
+                    val_labels_epoch.append(y.detach().cpu())
 
         # 验证指标 + 阈值搜索
         y_prob_v = torch.cat(y_prob_v).numpy()
@@ -771,6 +783,45 @@ def train(train_loader, val_loader, device):
 
         # 混淆矩阵（使用 thr*）
         cm = confusion_matrix(y_true_v, (y_prob_v >= best_thr).astype(int))
+        # === 每受试者命中/失误统计（使用本轮 best_thr） ===
+        sid_np = torch.cat(val_sids).numpy()             # [N]
+        y_np   = torch.cat(val_labels_epoch).numpy()     # [N]
+        pred_np = (y_prob_v >= best_thr).astype(int)     # [N]
+
+        per_subject = defaultdict(lambda: {"label": None, "correct": 0, "wrong": 0})
+        for s, y_true, y_pred in zip(sid_np, y_np, pred_np):
+            s = int(s)
+            lab = "MDD" if int(y_true) == 1 else "HC"
+            if per_subject[s]["label"] is None:
+                per_subject[s]["label"] = lab
+            # 若发现同一 sid 的标签不一致，这里以首次为准；也可断言一致
+            if int(y_pred) == int(y_true):
+                per_subject[s]["correct"] += 1
+            else:
+                per_subject[s]["wrong"] += 1
+
+        # 写出 JSON（每个 epoch 一份）
+        result_dir = os.path.join("result", f"fold{val_fold}")
+        os.makedirs(result_dir, exist_ok=True)
+        out_path = os.path.join(result_dir, f"val_subject_hitmiss_e{epoch:03d}.json")
+
+        items = [{"subject_id": int(s), **v}
+                for s, v in sorted(per_subject.items(), key=lambda kv: (1_000_000_000 if kv[0] < 0 else kv[0]))]
+
+        payload = {
+            "epoch": int(epoch),
+            "best_thr": float(best_thr),
+            "val_bal_acc": float(balacc_v * 100.0),
+            "val_acc": float(val_acc),
+            "f1": float(f1_v),
+            "auc": float(auc_v),
+            "fold": int(val_fold),
+            "subjects": items
+        }
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"[VAL] 每受试者命中/失误统计已写入：{out_path}")
+
 
         # === 你要求的打印格式 ===
         print(f"Epoch {epoch:3d}/{EPOCHS}")
@@ -874,7 +925,7 @@ def run_single_fold(slices_root="./slices", val_fold=1, folds=5, epochs=EPOCHS, 
 
     # === 训练 ===
     with tee_stdout(log_path):
-        metrics = train(train_loader=train_loader, val_loader=val_loader, device=device)
+        metrics = train(train_loader=train_loader, val_loader=val_loader, device=device, val_fold=val_fold)
 
     print(f"[DONE] Fold {val_fold} 最优 BalAcc={metrics['best_bal_acc']:.2f}% (epoch {metrics['best_epoch']})，"
           f"Acc={metrics['val_acc']:.2f}%  F1={metrics['f1']:.3f}  AUC={metrics['auc']:.3f}  thr*={metrics['best_thr']:.2f}")
