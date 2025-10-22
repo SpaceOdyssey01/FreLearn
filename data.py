@@ -74,8 +74,13 @@ class EEGFeatureDataset(Dataset):
         self.strength = 0.6
 
         self.mode = None  # 'pt_dir' | 'pt_single' | 'npz_dir'
-        self._npz_files = []
+        self._npz_files = sorted([os.path.join(feature_path, f) for f in os.listdir(feature_path) if f.endswith(".npz")])
         self._npz_index = []
+        labels_cat = []
+        subjects_cat = []
+        total = 0
+
+        
         self._npz_cache = OrderedDict()
         self._npz_cache_files = max(1, int(npz_cache_files))
         self._wav = None
@@ -122,21 +127,31 @@ class EEGFeatureDataset(Dataset):
                 # .npz -> AE.encode(z) -> WT
                 self.mode = 'npz_dir'
                 self._npz_files = sorted(
-                    [os.path.join(feature_path, f) for f in os.listdir(feature_path) if f.endswith(".npz")])
+                    [os.path.join(feature_path, f) for f in os.listdir(feature_path) if f.endswith(".npz")]
+                )
                 if not self._npz_files:
                     raise FileNotFoundError(f"No .npz under: {feature_path}")
+
                 total = 0
                 labels_cat = []
+                subjects_cat = []  # <<< 新增
                 for fi, f in enumerate(self._npz_files):
                     with np.load(f) as npz:
                         n = int(npz["segments"].shape[0])
                         labs = torch.from_numpy(npz["labels"]).long()
+                        # 容错：旧分片可能没有 subjects；则用 -1 填充（后续还能用 path 兜底）
+                        subs = (torch.from_numpy(npz["subjects"]).long()
+                                if ("subjects" in npz.files) else torch.full((n,), -1, dtype=torch.long))
                     for li in range(n):
                         self._npz_index.append((fi, li))
                     labels_cat.append(labs)
+                    subjects_cat.append(subs)   # <<< 新增
                     total += n
+
                 self.labels = torch.cat(labels_cat, dim=0)
+                self.subjects = torch.cat(subjects_cat, dim=0)  # <<< 新增（便于调试用）
                 self.total = total
+
 
                 # WT（CPU/GPU 按 wt_device）
                 self._wav = WaveletTransform(wave=wave_name, device=wt_device)
@@ -320,26 +335,32 @@ class EEGFeatureDataset(Dataset):
             arr = self._npz_cache.pop(file_idx)
             self._npz_cache[file_idx] = arr
             return arr
+
         f = self._npz_files[file_idx]
         with np.load(f) as npz:
-            segs = torch.from_numpy(npz["segments"]).float()
+            segs = torch.from_numpy(npz["segments"]).float()  # [N,C,H,W]
             labs = torch.from_numpy(npz["labels"]).long()
-            sids = torch.from_numpy(npz["subjects"]).long() if ("subjects" in npz.files) else None
-        pack = {"segs": segs, "labs": labs, "sids": sids}
-        self._npz_cache[file_idx] = pack
+            subs = (torch.from_numpy(npz["subjects"]).long()
+                    if ("subjects" in npz.files) else torch.full((segs.shape[0],), -1, dtype=torch.long))
+
+        arr = (segs, labs, subs)
+        self._npz_cache[file_idx] = arr
         if len(self._npz_cache) > self._npz_cache_files:
             self._npz_cache.popitem(last=False)
-        return pack   # ← 关键
+        return arr
+
 
 
     def _get_item_from_npz(self, idx):
         file_idx, local_idx = self._npz_index[idx]
-        pack = self._load_npz_file(file_idx)
-        segs, labs, sids = pack["segs"], pack["labs"], pack["sids"]
-        x = segs[local_idx].unsqueeze(0).float()
+        segs, labs, subs = self._load_npz_file(file_idx)   # 只取一次
+
+        x = segs[local_idx].unsqueeze(0).float()          # [1,C,H,W]
         y = int(labs[local_idx].item())
-        sid = int(sids[local_idx].item()) if (sids is not None) else -1
-        x_raw_pad, _, _ = pad_to_even(x)  # raw：pad 后原图
+        sid = int(subs[local_idx].item())
+
+        # raw：pad 后原图
+        x_raw_pad, _, _ = pad_to_even(x)
 
         # AE.encode 得到 z
         if self.use_ae_encoder and (self.ae is not None):
@@ -351,6 +372,7 @@ class EEGFeatureDataset(Dataset):
 
         x_enc_pad, _, _ = pad_to_even(x_enc)
         low, hh, hv, hd = self._wav(x_enc_pad)
+
         return low[0].clone(), hh[0].clone(), hv[0].clone(), hd[0].clone(), y, x_raw_pad[0].clone(), sid
 
     def __getitem__(self, idx):
@@ -388,8 +410,14 @@ class EEGFeatureDataset(Dataset):
         sample = {
             "low": low, "high_h": hh, "high_v": hv, "high_d": hd,
             "label": torch.tensor(label, dtype=torch.long),
-            "sid": torch.tensor(sid, dtype=torch.long)
+            "sid": torch.tensor(sid, dtype=torch.long),   # ← 保留！
         }
         if raw is not None:
             sample["raw"] = raw
+
+        if self.mode == 'npz_dir':
+            file_idx, _ = self._npz_index[idx]
+            sample["path"] = self._npz_files[file_idx]
+
         return sample
+
