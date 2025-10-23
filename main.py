@@ -5,10 +5,9 @@ from data import *
 from contrast import HLF_RelationLoss_BP
 import json
 from collections import defaultdict
-
+from typing import List
 
 class Resize2D(nn.Module):
-    """任意比例/目标尺寸缩放；下采样建议使用 area（等价于平均池化）。"""
 
     def __init__(self, mode: str = "area", antialias: bool = True):
         super().__init__()
@@ -158,8 +157,6 @@ def prob_balance_loss_from_logits(logits, target_prior=None):
     target = torch.full_like(p, 1.0 / p.numel()) if target_prior is None else target_prior.to(p)
     return F.kl_div(p.log(), target, reduction='batchmean')
 
-
-# ======= CloFormer 风格模块（简化） =======
 class _AttnMap2D(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -168,78 +165,140 @@ class _AttnMap2D(nn.Module):
             nn.SiLU(inplace=True),
             nn.Conv2d(dim, dim, kernel_size=1, bias=True),
         )
-
-    def forward(self, x): return self.net(x)
-
-
-class _CloLocal2D(nn.Module):
-    def __init__(self, dim, dw_kernel=3, heads=4):
-        super().__init__()
-        assert dim % heads == 0
-        self.heads = heads
-        self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=True)
-        self.dw_q = nn.Conv2d(dim, dim, kernel_size=dw_kernel, padding=dw_kernel // 2, groups=dim, bias=True)
-        self.dw_k = nn.Conv2d(dim, dim, kernel_size=dw_kernel, padding=dw_kernel // 2, groups=dim, bias=True)
-        self.dw_v = nn.Conv2d(dim, dim, kernel_size=dw_kernel, padding=dw_kernel // 2, groups=dim, bias=True)
-        self.map = _AttnMap2D(dim)
-        self.scale = (dim // heads) ** -0.5
-
     def forward(self, x):
-        q, k, v = self.qkv(x).chunk(3, dim=1)
-        q = self.dw_q(q);
-        k = self.dw_k(k);
-        v = self.dw_v(v)
-        attn = torch.tanh(self.map(q * k) * self.scale)
-        return attn * v
+        return self.net(x)
 
-
-class _CloGlobal2D(nn.Module):
-    def __init__(self, dim, heads=4, window=7):
+class _LocalBranch(nn.Module):
+   
+    def __init__(self, dim, dim_head, group_heads: int, kernel_size: int, qkv_bias=True, attn_drop=0.0):
         super().__init__()
-        assert dim % heads == 0
-        self.heads = heads
-        self.to_q = nn.Conv2d(dim, dim, kernel_size=1, bias=True)
-        self.to_kv = nn.Conv2d(dim, dim * 2, kernel_size=1, bias=True)
-        self.pool = nn.AvgPool2d(kernel_size=window, stride=window) if window > 1 else nn.Identity()
-        self.scale = (dim // heads) ** -0.5
+        self.dim_head = dim_head
+        self.group_heads = group_heads
+        self.m = group_heads * dim_head
+        self.to_qkv = nn.Conv2d(dim, 3 * self.m, kernel_size=1, bias=qkv_bias)
 
-    def forward(self, x):
-        B, C, H, W = x.shape;
-        h = self.heads
-        q = self.to_q(x)
-        kv = self.pool(x)
-        k, v = self.to_kv(kv).chunk(2, dim=1)
+        # 对拼接后的 QKV 一次性做 DW 卷积（和 blocks.py 对齐）
+        self.mixer = nn.Conv2d(3 * self.m, 3 * self.m, kernel_size=kernel_size,
+                               stride=1, padding=kernel_size // 2, groups=3 * self.m, bias=True)
 
-        def _reshape(t, HH, WW): return t.view(B, h, C // h, HH * WW)
+        self.attn_map = _AttnMap2D(self.m)   # 对 q*k 做门控映射
+        self.scale = (self.dim_head) ** -0.5
+        self.attn_drop = nn.Dropout(attn_drop)
 
-        q = _reshape(q, H, W);
-        k = _reshape(k, *kv.shape[-2:]);
-        v = _reshape(v, *kv.shape[-2:])
-        attn = torch.matmul(q.transpose(-1, -2), k) * self.scale
-        attn = attn.softmax(dim=-1)
-        out = torch.matmul(attn, v.transpose(-1, -2)).transpose(-1, -2).contiguous().view(B, C, H, W)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        qkv = self.to_qkv(x)                               # [B, 3m, H, W]
+        qkv = self.mixer(qkv)                              # DWConv 混合
+        q, k, v = qkv.chunk(3, dim=1)                      # 各 [B, m, H, W]
+        attn = self.attn_map(q * k) * self.scale
+        attn = torch.tanh(attn)
+        attn = self.attn_drop(attn)
+        out = attn * v                                     # [B, m, H, W]
         return out
 
-
-class CloBlock2D(nn.Module):
-    def __init__(self, dim, heads=4, dw_kernel=3, window=7, drop=0.0):
+class _GlobalBranch(nn.Module):
+    
+    def __init__(self, dim, dim_head, group_heads: int, window: int, qkv_bias=True, attn_drop=0.0):
         super().__init__()
-        self.norm = nn.GroupNorm(1, dim)
-        self.local = _CloLocal2D(dim, dw_kernel=dw_kernel, heads=heads)
-        self.global_ = _CloGlobal2D(dim, heads=heads, window=window)
-        self.fuse = nn.Conv2d(dim * 2, dim, kernel_size=1, bias=True)
-        self.drop = nn.Dropout2d(drop)
+        self.dim_head = dim_head
+        self.group_heads = group_heads
+        self.m = group_heads * dim_head
+        self.to_q  = nn.Conv2d(dim, self.m, kernel_size=1, bias=qkv_bias)
+        self.to_kv = nn.Conv2d(dim, 2 * self.m, kernel_size=1, bias=qkv_bias)
+        self.pool  = nn.AvgPool2d(kernel_size=window, stride=window) if window > 1 else nn.Identity()
+        self.scale = (self.dim_head) ** -0.5
+        self.attn_drop = nn.Dropout(attn_drop)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        h = self.group_heads
+        dh = self.dim_head
+
+        q = self.to_q(x)                                   # [B, m, H, W]
+        kv_in = self.pool(x)                               # [B, C, H', W']
+        k, v = self.to_kv(kv_in).chunk(2, dim=1)           # [B, m, H', W'], [B, m, H', W']
+
+        # reshape 到多头
+        def to_heads(t, HH, WW):                           # t: [B, m, HH, WW]
+            return t.view(B, h, dh, HH * WW)               # [B, h, dh, L]
+        q = to_heads(q,  H,  W)                            # [B, h, dh, HW]
+        k = to_heads(k, *kv_in.shape[-2:])                 # [B, h, dh, H'W']
+        v = to_heads(v, *kv_in.shape[-2:])                 # [B, h, dh, H'W']
+
+        attn = torch.matmul(q.transpose(-1, -2), k) * self.scale   # [B, h, HW, H'W']
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        out = torch.matmul(attn, v.transpose(-1, -2))              # [B, h, HW, dh]
+        out = out.transpose(-1, -2).contiguous().view(B, self.m, H, W)  # [B, m, H, W]
+        return out
+
+class CloBlock2D_MS(nn.Module):
+   
+    def __init__(self,
+                 dim: int,
+                 num_heads: int,
+                 group_split: List[int],
+                 kernel_sizes: List[int],
+                 window: int = 7,
+                 attn_drop: float = 0.0,
+                 proj_drop: float = 0.0,
+                 qkv_bias: bool = True):
+        super().__init__()
+        assert sum(group_split) == num_heads, "sum(group_split) must equal num_heads"
+        assert len(kernel_sizes) + 1 == len(group_split), "len(kernel_sizes)+1 must equal len(group_split)"
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+
+        self.dim = dim
+        self.num_heads = num_heads
+        self.dim_head = dim // num_heads
+        self.group_split = group_split
+        self.kernel_sizes = kernel_sizes
+        self.window = window
+
+        self.norm = nn.GroupNorm(1, dim)
+
+        # 构建局部多尺度分支
+        locals_ = []
+        for g_heads, ksz in zip(group_split[:-1], kernel_sizes):
+            if g_heads > 0:
+                locals_.append(
+                    _LocalBranch(dim, self.dim_head, g_heads, ksz, qkv_bias=qkv_bias, attn_drop=attn_drop)
+                )
+        self.local_branches = nn.ModuleList(locals_)
+
+        # 构建全局分支（最后一个 split）
+        self.global_branch = None
+        g_heads_global = group_split[-1]
+        if g_heads_global > 0:
+            self.global_branch = _GlobalBranch(dim, self.dim_head, g_heads_global,
+                                               window=window, qkv_bias=qkv_bias, attn_drop=attn_drop)
+
+        # 融合投影：cat(各分支) → 1x1 → [B, dim, H, W]
+        self.proj = nn.Conv2d(dim, dim, kernel_size=1, bias=True)
+        self.proj_drop = nn.Dropout2d(proj_drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         shortcut = x
         x = self.norm(x)
-        xl = self.local(x)
-        xg = self.global_(x)
-        y = self.fuse(torch.cat([xl, xg], dim=1))
-        y = self.drop(y)
-        return shortcut + y
 
-# --- main.py: SimpleProjector 改造（新增 spatial_only 模式） ---
+        outs = []
+        for lb in self.local_branches:
+            outs.append(lb(x))                 # 每个 [B, g_heads*dh, H, W]
+
+        if self.global_branch is not None:
+            outs.append(self.global_branch(x)) # [B, g_heads_global*dh, H, W]
+
+
+        if len(outs) == 0:
+            return shortcut
+
+        y = torch.cat(outs, dim=1)            # [B, sum_heads*dh, H, W] == [B, dim, H, W]
+        y = self.proj(y)                      # [B, dim, H, W]
+        y = self.proj_drop(y)
+        return shortcut + y                   # 残差
+
+
 class SimpleProjector(nn.Module):
     def __init__(self, in_channels, out_dim=128, patch=(16, 3), dropout=0.0,
                  clo_depth=1, clo_heads=3, clo_window=7, clo_dw_kernel=3,
@@ -249,11 +308,11 @@ class SimpleProjector(nn.Module):
         self.spatial_only = bool(spatial_only)
         self.inorm = nn.InstanceNorm2d(in_channels, affine=True)
 
-        # 仅在非 spatial_only 下才启用“三导 softmax 融合 + 128通道语义路径”
+        
         self.use_fuse = (in_channels > 1) and (not self.spatial_only)
 
         if self.spatial_only:
-            # C→C 的轻量预处理 + CloBlock 堆叠（保持通道不变）
+            
             self.pre = nn.Sequential(
                 nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False),
                 nn.GroupNorm(1, in_channels),
@@ -261,15 +320,23 @@ class SimpleProjector(nn.Module):
                 nn.Dropout2d(dropout),
             )
             self.clo = nn.Sequential(*[
-                CloBlock2D(in_channels, heads=clo_heads,
-                           dw_kernel=clo_dw_kernel, window=clo_window,
-                           drop=dropout)
+                CloBlock2D_MS(
+                    
+                    dim=in_channels,
+                    num_heads=clo_heads,
+                    group_split=[max(1, clo_heads//3), max(1, clo_heads//3), clo_heads - 2*max(1, clo_heads//3)],
+                    kernel_sizes=[clo_dw_kernel, max(3, clo_dw_kernel-2)],
+                    window=clo_window,
+                    
+                    attn_drop=0.0,
+                    proj_drop=0.0,
+                    qkv_bias=True
+                )
                 for _ in range(max(1, int(clo_depth)))
             ])
-            # 可替换为 AvgPool2d/Conv(stride>1) 做 H/W 调整；这里默认不变
             self.down = nn.Identity()
         else:
-            # === 原有 128 通道语义路径（保持你的旧实现） ===
+
             self.out_dim = int(out_dim)
             self.patch = tuple(patch)
             if self.use_fuse:
@@ -279,8 +346,16 @@ class SimpleProjector(nn.Module):
                 nn.GroupNorm(8, self.out_dim), nn.GELU(), nn.Dropout2d(dropout),
             )
             self.clo = nn.Sequential(*[
-                CloBlock2D(self.out_dim, heads=clo_heads,
-                           dw_kernel=clo_dw_kernel, window=clo_window, drop=dropout)
+                CloBlock2D_MS(
+                    dim=self.out_dim,
+                    num_heads=clo_heads,
+                    group_split=[max(1, clo_heads//3), max(1, clo_heads//3), clo_heads - 2*max(1, clo_heads//3)],
+                    kernel_sizes=[clo_dw_kernel, max(3, clo_dw_kernel-2)],
+                    window=clo_window,
+                    attn_drop=0.0,
+                    proj_drop=0.0,
+                    qkv_bias=True
+                )
                 for _ in range(max(1, int(clo_depth)))
             ])
             ph, pw = self.patch
@@ -291,7 +366,7 @@ class SimpleProjector(nn.Module):
             self.vec_dp = nn.Dropout(dropout)
 
     def _fuse_channels(self, x):
-        # 仅非 spatial_only 时才会被调用（保持你原实现）
+
         B, C, H, W = x.shape
         gap = x.mean(dim=(2, 3))
         w = F.softmax(self.fuse_fc(gap), dim=1).view(B, C, 1, 1)
@@ -301,17 +376,16 @@ class SimpleProjector(nn.Module):
         x = self.inorm(x)
 
         if self.spatial_only:
-            # 图域路径：C=3 → C=3，只改 H/W 统计，不做3→1或C→128
+           
             x = self.pre(x)
             x = self.clo(x)
             x = self.down(x)                         # [B,3,H',W']
-            # 若需要精确对齐子带分辨率（H/2,W/2），可用 subband_size 指定
+
             if (subband_size is not None) and (x.shape[-2:] != subband_size):
                 x = F.interpolate(x, size=subband_size, mode="bilinear", align_corners=False)
             # spatial_only 返回“子带图”（供 iDWT 和 HLF）
             return (x, x) if return_feat else x
 
-        # === 原 128 维语义路径（保留你的旧逻辑，以便回滚/消融） ===
         if self.use_fuse:
             x = self._fuse_channels(x)
         x = self.pre(x)
@@ -343,7 +417,7 @@ class GatedMLP(nn.Module):
         return self.drop(x)
 
 
-# --- main.py: 新增图域融合版的 stage 封装 ---
+
 class HighGateMap(nn.Module):
     """从三张高频子带图（hh/hv/hd）计算 (B,3,1,1) 的样本级权重"""
     def __init__(self, c_in=3, hidden=16):
@@ -360,7 +434,7 @@ class HighGateMap(nn.Module):
         return w
 
 class AlphaHL(nn.Module):
-    """从低/高融合候选图得到像素无关的 α（也可做通道相关）"""
+    """从低/高融合候选图得到像素无关的 α"""
     def __init__(self, c_in=3, hidden=16):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -387,30 +461,27 @@ def stage_spatial_fusion_iwt(
     # WT
     low, hh, hv, hd = wt(x_b)  # [B,3,H/2,W/2] ×4
 
-    # 四个 projector（spatial_only=True）：返回子带图 & feat（给 HLF）
+
     low_map, feat_low = conv_low(low, return_feat=True, subband_size=low.shape[-2:])
     hh_map,  feat_hh  = conv_hh(hh,  return_feat=True, subband_size=hh.shape[-2:])
     hv_map,  feat_hv  = conv_hv(hv,  return_feat=True, subband_size=hv.shape[-2:])
     hd_map,  feat_hd  = conv_hd(hd,  return_feat=True, subband_size=hd.shape[-2:])
 
-    # HLF 关系对比（3通道即可）
     cl_loss = hlf_seq_loss(feat_hh.float(), feat_hv.float(), feat_hd.float(), feat_low.float())
 
-    # 高频三路样本级门控合成：仍是图域 [B,3,H/2,W/2]
+
     w3 = high_gate_map(hh_map, hv_map, hd_map)                   # [B,3,1,1]
     high_stack = torch.stack([hh_map, hv_map, hd_map], dim=1)    # [B,3,3,H/2,W/2]
     high_map = (high_stack * w3.unsqueeze(2)).sum(dim=1)         # [B,3,H/2,W/2]
 
-    # 低-高图域 α 融合
+
     alpha = alpha_hl(low_map, high_map)                          # [B,3,1,1]
     low_f = (1.0 - alpha) * low_map + alpha * high_map           # [B,3,H/2,W/2]
-    hh_f, hv_f, hd_f = hh_map, hv_map, hd_map                    # 也可各自做 α 与 low_map 融合
+    hh_f, hv_f, hd_f = hh_map, hv_map, hd_map              
 
-    # iDWT 重建到输入分辨率
     x_rec = wt.inverse(low_f, hh_f, hv_f, hd_f)
     if (ph or pw): x_rec = x_rec[..., :H0, :W0]
 
-    # 可选：按比例缩放后再做残差融合
     if (scale is not None) and (scale < 1.0):
         if resizer is None: resizer = Resize2D(mode="area")
         Ht, Wt = max(1, int(H0 * scale)), max(1, int(W0 * scale))
@@ -522,7 +593,7 @@ def stage_proj_contrast_mod_resfuse(
         x_rec_s = resizer(x_recon, size=(Ht, Wt))
         x_out = resfuser(fused, x_in_s, x_rec_s)
     else:
-        # 不缩放时两者现在已同尺寸
+        
         x_out = resfuser(fused, x_in, x_recon)
 
     return fused, x_out, cl_loss
@@ -551,7 +622,6 @@ def train(train_loader, val_loader, device, val_fold):
     hlf_seq_lossM = HLF_RelationLoss_BP(temperature=0.15, pool_hw=(4,4), proj_hidden=64, proj_out=32, p_drop=0.2).to(device)
     hlf_seq_loss2 = HLF_RelationLoss_BP(temperature=0.15, pool_hw=(4,4), proj_hidden=64, proj_out=32, p_drop=0.2).to(device)
 
-    # ===== 优化器、调度器、EMA =====
     def _pg(m):
         return [{"params": [p for p in m.parameters() if p.requires_grad], "weight_decay": WEIGHT_DECAY}]
     optim_params = []
@@ -568,6 +638,18 @@ def train(train_loader, val_loader, device, val_fold):
     for m in [high_gate_map, alpha_hl, resfuser, classifier,
               hlf_seq_loss1, hlf_seq_lossM, hlf_seq_loss2]:
         _add(m, HEAD_LR)
+        
+    modules_to_count = [
+        conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
+        conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
+        conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
+        high_gate_map, alpha_hl, resfuser, classifier,
+        hlf_seq_loss1, hlf_seq_lossM, hlf_seq_loss2,
+    ]
+    total_params = sum(p.numel() for m in modules_to_count for p in m.parameters())
+    trainable_params = sum(p.numel() for m in modules_to_count for p in m.parameters() if p.requires_grad)
+    print(f"\n[Model Params] Total: {total_params:,} | Trainable: {trainable_params:,}\n")
+
 
     optimizer = torch.optim.AdamW(optim_params)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -583,11 +665,10 @@ def train(train_loader, val_loader, device, val_fold):
     }
     ema = EMA(ema_modules, decay=EMA_DECAY)
 
-    # ===== 损失（统一用 CE；NUM_CLASSES=2 时更稳） =====
     criterion = nn.CrossEntropyLoss().to(device)
     def _prep_y(y): return y.long()
 
-    # ---- 辅助：在验证集上搜阈值（最大化 Balanced Accuracy）----
+
     import numpy as np
     from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score, confusion_matrix
 
@@ -603,14 +684,14 @@ def train(train_loader, val_loader, device, val_fold):
                 best_bal, best_thr, best_f1, best_acc, best_pos = bal, thr, f1, acc, posr
         return best_thr, best_bal, best_f1, best_acc, best_pos
 
-    # ===== 训练循环 =====
+
     best_val = -1.0
     best_pack = {"balacc": 0.0, "f1": 0.0, "auc": 0.5, "epoch": 0, "thr": 0.5}
 
     for epoch in range(1, EPOCHS + 1):
         tic = time.time()
 
-        # ---- train mode ----
+       
         for m in [conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
                   conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
                   conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
@@ -618,7 +699,7 @@ def train(train_loader, val_loader, device, val_fold):
                   hlf_seq_loss1, hlf_seq_lossM, hlf_seq_loss2]:
             m.train()
 
-        # 训练/验证累计器
+
         total, total_cl, total_cls = 0, 0.0, 0.0
 
         y_prob_all, y_true_all = [], []
@@ -639,7 +720,7 @@ def train(train_loader, val_loader, device, val_fold):
                 resizer=None, scale=STAGE1_SCALE
             )
 
-            # Stage-M
+            
             y1, clM = stage_spatial_fusion_iwt(
                 x_in=y0, wt=wt_runtime,
                 conv_low=conv_low_M, conv_hh=conv_hh_M, conv_hv=conv_hv_M, conv_hd=conv_hd_M,
@@ -648,7 +729,7 @@ def train(train_loader, val_loader, device, val_fold):
                 resizer=None, scale=STAGEM_SCALE
             )
 
-            # Stage-2（分类）
+            # Stage-2
             y1_b, _, _ = pad_to_even(y1)
             low2, hh2, hv2, hd2 = wt_runtime(y1_b)
             low2_map, feat_low2 = conv_low_2(low2, return_feat=True, subband_size=low2.shape[-2:])
@@ -685,7 +766,7 @@ def train(train_loader, val_loader, device, val_fold):
                 y_prob_all.append(prob1.detach().cpu())
                 y_true_all.append(y.detach().cpu())
 
-        # 训练集监控（固定 thr=0.5）
+        
         train_loss /= max(1, n_train)
         y_prob_all = torch.cat(y_prob_all).numpy()
         y_true_all = torch.cat(y_true_all).numpy()
@@ -693,7 +774,7 @@ def train(train_loader, val_loader, device, val_fold):
         train_acc = float((pred_tr == y_true_all).mean() * 100.0)
         train_pos_rate = float(pred_tr.mean() * 100.0)
 
-        # ---- eval mode ----
+       
         for m in [conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
                   conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
                   conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
@@ -701,11 +782,11 @@ def train(train_loader, val_loader, device, val_fold):
                   hlf_seq_loss1, hlf_seq_lossM, hlf_seq_loss2]:
             m.eval()
 
-        # 验证累计器
+        
         val_total, val_cl, val_cls = 0, 0.0, 0.0
         y_prob_v, y_true_v = [], []
-        val_sids = []             # ← 每个 epoch 清空
-        val_labels_epoch = []     # ← 每个 epoch 清空
+        val_sids = []             
+        val_labels_epoch = []    
         with ema.apply(ema_modules):
             with torch.no_grad():
                 for batch in val_loader:
@@ -760,12 +841,12 @@ def train(train_loader, val_loader, device, val_fold):
                     y_true_v.append(y.detach().cpu())
                     sid_b = batch.get("sid", None)
                     if sid_b is None:
-                        # 兼容：如果数据集没返回 sid，就全部记 -1
+                    
                         sid_b = torch.full_like(y, fill_value=-1)
                     val_sids.append(sid_b.detach().cpu())
                     val_labels_epoch.append(y.detach().cpu())
 
-        # 验证指标 + 阈值搜索
+        # 验证指标 
         y_prob_v = torch.cat(y_prob_v).numpy()
         y_true_v = torch.cat(y_true_v).numpy()
 
@@ -783,7 +864,7 @@ def train(train_loader, val_loader, device, val_fold):
 
         # 混淆矩阵（使用 thr*）
         cm = confusion_matrix(y_true_v, (y_prob_v >= best_thr).astype(int))
-        # === 每受试者命中/失误统计（使用本轮 best_thr） ===
+     
         sid_np = torch.cat(val_sids).numpy()             # [N]
         y_np   = torch.cat(val_labels_epoch).numpy()     # [N]
         pred_np = (y_prob_v >= best_thr).astype(int)     # [N]
@@ -853,7 +934,7 @@ def train(train_loader, val_loader, device, val_fold):
                 "ema": ema.shadow
             }, "best_ckpt_spatial_only.pth")
 
-    # ===== 返回指标 =====
+   
     return {
         "best_epoch": int(best_pack["epoch"]),
         "best_bal_acc": float(best_pack["balacc"] * 100.0),
@@ -901,29 +982,31 @@ def run_single_fold(slices_root="./slices", val_fold=1, folds=5, epochs=EPOCHS, 
     print("Val:", val_dir)
     print(f"Result dir: {result_dir}")
 
-    # === 组装 DataLoader ===
-    device = torch.device("cuda" if (torch.cuda.is_available() and ae_device == "cuda") else "cpu")
+
+    device = torch.device("cuda" if (torch.cuda.is_available() ) else "cpu")
 
     train_datasets = [
         EEGFeatureDataset(
             feature_path=td, augment=True,
             use_ae_encoder=use_ae_encoder, ae_ckpt=ae_ckpt,
-            ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch, ae_device=ae_device,
-            wave_name="coif1", wt_device=device.type
+            ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch, ae_device="cpu",
+            wave_name="coif1", wt_device="cpu"
         ) for td in train_dirs
     ]
     train_ds = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
+
+    # 验证集
     val_ds = EEGFeatureDataset(
         feature_path=val_dir, augment=False,
         use_ae_encoder=use_ae_encoder, ae_ckpt=ae_ckpt,
-        ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch, ae_device=ae_device,
-        wave_name="coif1", wt_device=device.type
+        ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch, ae_device="cpu",
+        wave_name="coif1", wt_device="cpu"
     )
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=4, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    # === 训练 ===
+
     with tee_stdout(log_path):
         metrics = train(train_loader=train_loader, val_loader=val_loader, device=device, val_fold=val_fold)
 
