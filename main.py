@@ -6,6 +6,81 @@ from contrast import HLF_RelationLoss_BP
 import json
 from collections import defaultdict
 from typing import List
+import time
+from contextlib import contextmanager
+
+class StepProfiler:
+    def __init__(self, device, name="train", max_batches=100):
+        self.device = device
+        self.name = name
+        self.max_batches = max_batches
+        self.reset()
+
+    def reset(self):
+        self.n = 0
+        self.t_fetch = 0.0
+        self.t_to = 0.0
+        self.t_fwd = 0.0
+        self.t_bwd = 0.0
+        self.t_opt = 0.0
+        self.use_cuda_evt = (hasattr(self.device, "type") and self.device.type == "cuda")
+
+    @contextmanager
+    def _evt(self):
+        if self.use_cuda_evt:
+            import torch
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            start.record()
+            yield lambda: (end.record(), torch.cuda.synchronize(), start.elapsed_time(end) / 1000.0)
+        else:
+            t0 = time.perf_counter()
+            yield lambda: (None, None, time.perf_counter() - t0)
+
+    def add_fetch(self, dt):
+        if self.n < self.max_batches:
+            self.t_fetch += dt
+
+    def add_to(self, dt):
+        if self.n < self.max_batches:
+            self.t_to += dt
+
+    def add_fwd(self, dt):
+        if self.n < self.max_batches:
+            self.t_fwd += dt
+
+    def add_bwd(self, dt):
+        if self.n < self.max_batches:
+            self.t_bwd += dt
+
+    def add_opt(self, dt):
+        if self.n < self.max_batches:
+            self.t_opt += dt
+
+    def step_done(self):
+        self.n += 1
+
+    def summary(self):
+        n = max(1, min(self.n, self.max_batches))
+        total = (self.t_fetch + self.t_to + self.t_fwd + self.t_bwd + self.t_opt) / n
+        lines = [
+            f"[Profile:{self.name}] per-step avg over {n} batches (sec):",
+            f"  fetch(DataLoader): {self.t_fetch/n:.4f}",
+            f"  to(device)      : {self.t_to/n:.4f}",
+            f"  forward+loss    : {self.t_fwd/n:.4f}",
+            f"  backward        : {self.t_bwd/n:.4f}",
+            f"  optimizer step  : {self.t_opt/n:.4f}",
+            f"  ---- total(step): {total:.4f} sec"
+        ]
+        print("\n".join(lines))
+
+
+def timed_fetch(it):
+    t0 = time.perf_counter()
+    batch = next(it)
+    dt = time.perf_counter() - t0
+    return batch, dt
 
 class Resize2D(nn.Module):
 
@@ -597,12 +672,72 @@ def stage_proj_contrast_mod_resfuse(
         x_out = resfuser(fused, x_in, x_recon)
 
     return fused, x_out, cl_loss
-def train(train_loader, val_loader, device, val_fold):
-   
+def _build_ae_if_needed(use_ae_encoder: bool, device, ae_ckpt: str, ae_in_ch: int, ae_latent_ch: int):
+    """
+    在 GPU 上构建 AE，并把参数冻住，仅用于 encode()。
+    若未启用或加载失败，返回 None，等价于不做 AE 编码。
+    """
+    if not use_ae_encoder:
+        return None
+
+    # 你自己的 AE 类名（按需改成你项目里的类/构造函数）
+    AE_CANDIDATE_NAMES = ["AE", "AutoEncoder", "AEEncoder", "EEGAE"]
+
+    ae_cls = None
+    for name in AE_CANDIDATE_NAMES:
+        ae_cls = globals().get(name, None)
+        if ae_cls is not None:
+            break
+
+    if ae_cls is None:
+        print("[WARN] 未找到 AE 类，跳过 AE 编码。")
+        return None
+
+    try:
+        ae = ae_cls(in_ch=ae_in_ch, latent_ch=ae_latent_ch)  # 你的 AE 构造签名如不同，请在此调整
+    except TypeError:
+        try:
+            ae = ae_cls(ae_in_ch, ae_latent_ch)
+        except Exception as e:
+            print(f"[WARN] AE 构造失败：{e}；跳过 AE 编码。")
+            return None
+
+    try:
+        ckpt = torch.load(ae_ckpt, map_location="cpu")
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            ae.load_state_dict(ckpt["state_dict"], strict=False)
+        else:
+            ae.load_state_dict(ckpt, strict=False)
+        print(f"[INFO] AE 权重已加载：{ae_ckpt}")
+    except Exception as e:
+        print(f"[WARN] AE 权重加载失败：{e}；继续无 AE。")
+        return None
+
+    ae.to(device)
+    ae.eval()
+    for p in ae.parameters():
+        p.requires_grad_(False)
+    return ae
+
+
+def train(train_loader, val_loader, device, val_fold,
+          use_ae_encoder=False, ae_ckpt="./ae_ckpts/ae_best.pth", ae_in_ch=3, ae_latent_ch=3):
+    """
+    把 AE.encode 与 WT 都放到 GPU；Dataset 仅返回原始张量。
+    """
+
+    # —— cuDNN 性能设置（需要可复现则关掉 benchmark）
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    # 1) WT 放到 GPU（你原本就这么做）
     wt_runtime = WaveletTransform(wave="coif1", device=device.type).to(device)
 
+    # 2) AE（只在循环里做 encode）
+    ae = _build_ae_if_needed(use_ae_encoder, device, ae_ckpt, ae_in_ch, ae_latent_ch)
+
+    # 3) 其余模块定义（与你原来的保持一致）
     def _mk_proj():
-        # 关键：clo_heads=3，确保 3 % 3 == 0
         return SimpleProjector(
             in_channels=3, spatial_only=True,
             clo_depth=1, clo_heads=3, clo_dw_kernel=3, clo_window=7
@@ -625,8 +760,6 @@ def train(train_loader, val_loader, device, val_fold):
     def _pg(m):
         return [{"params": [p for p in m.parameters() if p.requires_grad], "weight_decay": WEIGHT_DECAY}]
     optim_params = []
-    val_sids = []
-    val_labels_epoch = []
     def _add(m, lr):
         for g in _pg(m):
             g["lr"] = lr; optim_params.append(g)
@@ -638,23 +771,10 @@ def train(train_loader, val_loader, device, val_fold):
     for m in [high_gate_map, alpha_hl, resfuser, classifier,
               hlf_seq_loss1, hlf_seq_lossM, hlf_seq_loss2]:
         _add(m, HEAD_LR)
-        
-    modules_to_count = [
-        conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
-        conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
-        conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
-        high_gate_map, alpha_hl, resfuser, classifier,
-        hlf_seq_loss1, hlf_seq_lossM, hlf_seq_loss2,
-    ]
-    total_params = sum(p.numel() for m in modules_to_count for p in m.parameters())
-    trainable_params = sum(p.numel() for m in modules_to_count for p in m.parameters() if p.requires_grad)
-    print(f"\n[Model Params] Total: {total_params:,} | Trainable: {trainable_params:,}\n")
 
-
-    optimizer = torch.optim.AdamW(optim_params)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=10
-    )
+    optimizer  = torch.optim.AdamW(optim_params)
+    scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=10)
+    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
 
     ema_modules = {
         "low1": conv_low_1, "hh1": conv_hh_1, "hv1": conv_hv_1, "hd1": conv_hd_1,
@@ -667,7 +787,6 @@ def train(train_loader, val_loader, device, val_fold):
 
     criterion = nn.CrossEntropyLoss().to(device)
     def _prep_y(y): return y.long()
-
 
     import numpy as np
     from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score, confusion_matrix
@@ -684,14 +803,12 @@ def train(train_loader, val_loader, device, val_fold):
                 best_bal, best_thr, best_f1, best_acc, best_pos = bal, thr, f1, acc, posr
         return best_thr, best_bal, best_f1, best_acc, best_pos
 
-
     best_val = -1.0
     best_pack = {"balacc": 0.0, "f1": 0.0, "auc": 0.5, "epoch": 0, "thr": 0.5}
 
+    # -----------------------------------------------------------------------------------
     for epoch in range(1, EPOCHS + 1):
-        tic = time.time()
-
-       
+        # ============== Train ==============
         for m in [conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
                   conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
                   conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
@@ -699,101 +816,37 @@ def train(train_loader, val_loader, device, val_fold):
                   hlf_seq_loss1, hlf_seq_lossM, hlf_seq_loss2]:
             m.train()
 
-
         total, total_cl, total_cls = 0, 0.0, 0.0
-
         y_prob_all, y_true_all = [], []
         train_loss, n_train = 0.0, 0
 
-        for batch in train_loader:
-            x = batch["raw"].to(device).float()       # [B,3,H,W]
-            y = _prep_y(batch["label"].to(device))    # [B]
+        prof = StepProfiler(device, name="train", max_batches=100)
+        it = iter(train_loader)
+        for step in range(len(train_loader)):
+            try:
+                batch, dt_fetch = timed_fetch(it)
+            except StopIteration:
+                break
+            prof.add_fetch(dt_fetch)
+
+            with prof._evt() as start_end:
+                # 1) H2D 复制（pin_memory + non_blocking 能加速）
+                x = batch["raw"].to(device, non_blocking=True).float()
+                y = batch["label"].to(device, non_blocking=True).long()
+
+                # 2) （可选）AE 编码：在 GPU 上做
+                if ae is not None and hasattr(ae, "encode"):
+                    with torch.no_grad():
+                        x = ae.encode(x)  # x 仍在 GPU 上
+
+                _, _, dt_to = start_end()
+            prof.add_to(dt_to)
 
             optimizer.zero_grad(set_to_none=True)
 
-            # Stage-1
-            y0, cl1 = stage_spatial_fusion_iwt(
-                x_in=x, wt=wt_runtime,
-                conv_low=conv_low_1, conv_hh=conv_hh_1, conv_hv=conv_hv_1, conv_hd=conv_hd_1,
-                high_gate_map=high_gate_map, alpha_hl=alpha_hl,
-                hlf_seq_loss=hlf_seq_loss1, resfuser=resfuser,
-                resizer=None, scale=STAGE1_SCALE
-            )
-
-            
-            y1, clM = stage_spatial_fusion_iwt(
-                x_in=y0, wt=wt_runtime,
-                conv_low=conv_low_M, conv_hh=conv_hh_M, conv_hv=conv_hv_M, conv_hd=conv_hd_M,
-                high_gate_map=high_gate_map, alpha_hl=alpha_hl,
-                hlf_seq_loss=hlf_seq_lossM, resfuser=resfuser,
-                resizer=None, scale=STAGEM_SCALE
-            )
-
-            # Stage-2
-            y1_b, _, _ = pad_to_even(y1)
-            low2, hh2, hv2, hd2 = wt_runtime(y1_b)
-            low2_map, feat_low2 = conv_low_2(low2, return_feat=True, subband_size=low2.shape[-2:])
-            hh2_map,  feat_hh2  = conv_hh_2(hh2,  return_feat=True, subband_size=hh2.shape[-2:])
-            hv2_map,  feat_hv2  = conv_hv_2(hv2,  return_feat=True, subband_size=hv2.shape[-2:])
-            hd2_map,  feat_hd2  = conv_hd_2(hd2,  return_feat=True, subband_size=hd2.shape[-2:])
-
-            cl2 = hlf_seq_loss2(feat_hh2.float(), feat_hv2.float(), feat_hd2.float(), feat_low2.float())
-
-            w3_2   = high_gate_map(hh2_map, hv2_map, hd2_map)
-            high2  = (torch.stack([hh2_map, hv2_map, hd2_map], dim=1) * w3_2.unsqueeze(2)).sum(dim=1)
-            alpha2 = alpha_hl(low2_map, high2)
-            low2_f = (1.0 - alpha2) * low2_map + alpha2 * high2
-
-            vec2   = low2_f.mean(dim=(2,3))                 # [B,3]
-            logits = classifier(vec2)                       # [B,NUM_CLASSES]
-            cls_loss = criterion(logits, y)
-
-            cl_loss_total = W_CL1 * cl1 + W_CLM * clM + W_CL2 * cl2
-            cl_loss_total = CL_SCALE * cl_loss_total
-            loss = W_CL * cl_loss_total + W_CLS * cls_loss
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(classifier.parameters(), max_norm=5.0)
-            optimizer.step(); ema.update(ema_modules)
-
-            bs = x.size(0)
-            total      += bs
-            total_cl   += cl_loss_total.item() * bs
-            total_cls  += cls_loss.item() * bs
-
-            train_loss += loss.item() * bs; n_train += bs
-            with torch.no_grad():
-                prob1 = F.softmax(logits, dim=1)[:, 1]
-                y_prob_all.append(prob1.detach().cpu())
-                y_true_all.append(y.detach().cpu())
-
-        
-        train_loss /= max(1, n_train)
-        y_prob_all = torch.cat(y_prob_all).numpy()
-        y_true_all = torch.cat(y_true_all).numpy()
-        pred_tr = (y_prob_all >= 0.5).astype(int)
-        train_acc = float((pred_tr == y_true_all).mean() * 100.0)
-        train_pos_rate = float(pred_tr.mean() * 100.0)
-
-       
-        for m in [conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
-                  conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
-                  conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
-                  high_gate_map, alpha_hl, resfuser, classifier,
-                  hlf_seq_loss1, hlf_seq_lossM, hlf_seq_loss2]:
-            m.eval()
-
-        
-        val_total, val_cl, val_cls = 0, 0.0, 0.0
-        y_prob_v, y_true_v = [], []
-        val_sids = []             
-        val_labels_epoch = []    
-        with ema.apply(ema_modules):
-            with torch.no_grad():
-                for batch in val_loader:
-                    x = batch["raw"].to(device).float()
-                    y = _prep_y(batch["label"].to(device))
-
-                    # Stage-1
+            with prof._evt() as start_end:
+                with torch.amp.autocast('cuda', enabled=(device.type == "cuda")):
+                    # -------- Stage-1 ----------
                     y0, cl1 = stage_spatial_fusion_iwt(
                         x_in=x, wt=wt_runtime,
                         conv_low=conv_low_1, conv_hh=conv_hh_1, conv_hv=conv_hv_1, conv_hd=conv_hd_1,
@@ -801,7 +854,7 @@ def train(train_loader, val_loader, device, val_fold):
                         hlf_seq_loss=hlf_seq_loss1, resfuser=resfuser,
                         resizer=None, scale=STAGE1_SCALE
                     )
-                    # Stage-M
+                    # -------- Stage-M ----------
                     y1, clM = stage_spatial_fusion_iwt(
                         x_in=y0, wt=wt_runtime,
                         conv_low=conv_low_M, conv_hh=conv_hh_M, conv_hv=conv_hv_M, conv_hd=conv_hd_M,
@@ -809,7 +862,7 @@ def train(train_loader, val_loader, device, val_fold):
                         hlf_seq_loss=hlf_seq_lossM, resfuser=resfuser,
                         resizer=None, scale=STAGEM_SCALE
                     )
-                    # Stage-2 + 分类
+                    # -------- Stage-2 ----------
                     y1_b, _, _ = pad_to_even(y1)
                     low2, hh2, hv2, hd2 = wt_runtime(y1_b)
                     low2_map, feat_low2 = conv_low_2(low2, return_feat=True, subband_size=low2.shape[-2:])
@@ -822,7 +875,6 @@ def train(train_loader, val_loader, device, val_fold):
                     high2  = (torch.stack([hh2_map, hv2_map, hd2_map], dim=1) * w3_2.unsqueeze(2)).sum(dim=1)
                     alpha2 = alpha_hl(low2_map, high2)
                     low2_f = (1.0 - alpha2) * low2_map + alpha2 * high2
-
                     vec2   = low2_f.mean(dim=(2,3))
                     logits = classifier(vec2)
                     cls_loss = criterion(logits, y)
@@ -830,65 +882,168 @@ def train(train_loader, val_loader, device, val_fold):
                     cl_loss_total = W_CL1 * cl1 + W_CLM * clM + W_CL2 * cl2
                     cl_loss_total = CL_SCALE * cl_loss_total
                     loss = W_CL * cl_loss_total + W_CLS * cls_loss
+                _, _, dt_fwd = start_end()
+            prof.add_fwd(dt_fwd)
+
+            with prof._evt() as start_end:
+                scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(classifier.parameters(), max_norm=5.0)
+                scaler.step(optimizer)
+                scaler.update()
+
+                ema.update(ema_modules)
+                _, _, dt_bwd = start_end()
+            prof.add_bwd(dt_bwd)
+            prof.step_done()
+            # 把优化器步进时间并到 backward 段上了；如需分开，可再加一段 profile
+
+            bs = x.size(0)
+            total      += bs
+            total_cl   += float(cl_loss_total.detach()) * bs
+            total_cls  += float(cls_loss.detach()) * bs
+            train_loss += float(loss.detach()) * bs; n_train += bs
+
+            with torch.no_grad():
+                prob1 = F.softmax(logits, dim=1)[:, 1]
+                y_prob_all.append(prob1.detach().cpu())      # ← 统一放 CPU，避免 cat 报设备不一致
+                y_true_all.append(y.detach().cpu())
+
+        prof.summary()
+
+        train_loss /= max(1, n_train)
+        y_prob_all = torch.cat(y_prob_all).numpy()
+        y_true_all = torch.cat(y_true_all).numpy()
+        pred_tr = (y_prob_all >= 0.5).astype(int)
+        train_acc = float((pred_tr == y_true_all).mean() * 100.0)
+        train_pos_rate = float(pred_tr.mean() * 100.0)
+
+        # ============== Val ==============
+        for m in [conv_low_1, conv_hh_1, conv_hv_1, conv_hd_1,
+                  conv_low_M, conv_hh_M, conv_hv_M, conv_hd_M,
+                  conv_low_2, conv_hh_2, conv_hv_2, conv_hd_2,
+                  high_gate_map, alpha_hl, resfuser, classifier,
+                  hlf_seq_loss1, hlf_seq_lossM, hlf_seq_loss2]:
+            m.eval()
+
+        val_total, val_cl, val_cls = 0, 0.0, 0.0
+        y_prob_v, y_true_v = [], []
+        val_sids, val_labels_epoch = [], []
+
+        with ema.apply(ema_modules):
+            with torch.no_grad():
+                prof_val = StepProfiler(device, name="val", max_batches=50)
+                it_val = iter(val_loader)
+                for step in range(len(val_loader)):
+                    try:
+                        batch, dt_fetch = timed_fetch(it_val)
+                    except StopIteration:
+                        break
+                    prof_val.add_fetch(dt_fetch)
+
+                    with prof_val._evt() as start_end:
+                        # 1) H2D 复制（pin_memory + non_blocking 能加速）
+                        x = batch["raw"].to(device, non_blocking=True).float()
+                        y = batch["label"].to(device, non_blocking=True).long()
+
+                        # 2) （可选）AE 编码：在 GPU 上做
+                        if ae is not None and hasattr(ae, "encode"):
+                            with torch.no_grad():
+                                x = ae.encode(x)  # x 仍在 GPU 上
+
+                        _, _, dt_to = start_end()
+                    prof_val.add_to(dt_to)
+
+                    with prof_val._evt() as start_end:
+                        # --- 与训练相同的前向 ---
+                        y0, cl1 = stage_spatial_fusion_iwt(
+                            x_in=x, wt=wt_runtime,
+                            conv_low=conv_low_1, conv_hh=conv_hh_1, conv_hv=conv_hv_1, conv_hd=conv_hd_1,
+                            high_gate_map=high_gate_map, alpha_hl=alpha_hl,
+                            hlf_seq_loss=hlf_seq_loss1, resfuser=resfuser,
+                            resizer=None, scale=STAGE1_SCALE
+                        )
+                        y1, clM = stage_spatial_fusion_iwt(
+                            x_in=y0, wt=wt_runtime,
+                            conv_low=conv_low_M, conv_hh=conv_hh_M, conv_hv=conv_hv_M, conv_hd=conv_hd_M,
+                            high_gate_map=high_gate_map, alpha_hl=alpha_hl,
+                            hlf_seq_loss=hlf_seq_lossM, resfuser=resfuser,
+                            resizer=None, scale=STAGEM_SCALE
+                        )
+                        y1_b, _, _ = pad_to_even(y1)
+                        low2, hh2, hv2, hd2 = wt_runtime(y1_b)
+                        low2_map, feat_low2 = conv_low_2(low2, return_feat=True, subband_size=low2.shape[-2:])
+                        hh2_map,  feat_hh2  = conv_hh_2(hh2,  return_feat=True, subband_size=hh2.shape[-2:])
+                        hv2_map,  feat_hv2  = conv_hv_2(hv2,  return_feat=True, subband_size=hv2.shape[-2:])
+                        hd2_map,  feat_hd2  = conv_hd_2(hd2,  return_feat=True, subband_size=hd2.shape[-2:])
+                        cl2 = hlf_seq_loss2(feat_hh2.float(), feat_hv2.float(), feat_hd2.float(), feat_low2.float())
+
+                        w3_2   = high_gate_map(hh2_map, hv2_map, hd2_map)
+                        high2  = (torch.stack([hh2_map, hv2_map, hd2_map], dim=1) * w3_2.unsqueeze(2)).sum(dim=1)
+                        alpha2 = alpha_hl(low2_map, high2)
+                        low2_f = (1.0 - alpha2) * low2_map + alpha2 * high2
+                        vec2   = low2_f.mean(dim=(2,3))
+                        logits = classifier(vec2)
+                        cls_loss = criterion(logits, y)
+
+                        cl_loss_total = W_CL1 * cl1 + W_CLM * clM + W_CL2 * cl2
+                        cl_loss_total = CL_SCALE * cl_loss_total
+                        loss = W_CL * cl_loss_total + W_CLS * cls_loss
+                        _, _, dt_fwd = start_end()
+                    prof_val.add_fwd(dt_fwd)
+                    prof_val.step_done()
 
                     bs = x.size(0)
                     val_total += bs
-                    val_cl    += cl_loss_total.item() * bs
-                    val_cls   += cls_loss.item() * bs
+                    val_cl    += float(cl_loss_total) * bs
+                    val_cls   += float(cls_loss) * bs
 
                     prob1 = F.softmax(logits, dim=1)[:, 1]
                     y_prob_v.append(prob1.detach().cpu())
                     y_true_v.append(y.detach().cpu())
+
                     sid_b = batch.get("sid", None)
                     if sid_b is None:
-                    
                         sid_b = torch.full_like(y, fill_value=-1)
                     val_sids.append(sid_b.detach().cpu())
                     val_labels_epoch.append(y.detach().cpu())
 
-        # 验证指标 
+                prof_val.summary()
+
+        # 验证指标
         y_prob_v = torch.cat(y_prob_v).numpy()
         y_true_v = torch.cat(y_true_v).numpy()
-
         try:
             auc_v = roc_auc_score(y_true_v, y_prob_v)
         except Exception:
             auc_v = 0.5
-
         best_thr, balacc_v, f1_v, val_acc_frac, pos_rate_at_thr = _search_best_thr(y_true_v, y_prob_v)
         val_acc = float(val_acc_frac * 100.0)
 
-        # 学习率区间
+        # 学习率区间（打印信息用）
         lr_list = [pg["lr"] for pg in optimizer.param_groups]
         lr_min, lr_max = (min(lr_list), max(lr_list)) if lr_list else (0.0, 0.0)
 
-        # 混淆矩阵（使用 thr*）
         cm = confusion_matrix(y_true_v, (y_prob_v >= best_thr).astype(int))
-     
-        sid_np = torch.cat(val_sids).numpy()             # [N]
-        y_np   = torch.cat(val_labels_epoch).numpy()     # [N]
-        pred_np = (y_prob_v >= best_thr).astype(int)     # [N]
 
+        # 写出 per-subject 命中/失误
+        sid_np = torch.cat(val_sids).numpy()
+        y_np   = torch.cat(val_labels_epoch).numpy()
+        pred_np = (y_prob_v >= best_thr).astype(int)
         per_subject = defaultdict(lambda: {"label": None, "correct": 0, "wrong": 0})
-        for s, y_true, y_pred in zip(sid_np, y_np, pred_np):
+        for s, y_true_i, y_pred_i in zip(sid_np, y_np, pred_np):
             s = int(s)
-            lab = "MDD" if int(y_true) == 1 else "HC"
+            lab = "MDD" if int(y_true_i) == 1 else "HC"
             if per_subject[s]["label"] is None:
                 per_subject[s]["label"] = lab
-            # 若发现同一 sid 的标签不一致，这里以首次为准；也可断言一致
-            if int(y_pred) == int(y_true):
+            if int(y_pred_i) == int(y_true_i):
                 per_subject[s]["correct"] += 1
             else:
                 per_subject[s]["wrong"] += 1
-
-        # 写出 JSON（每个 epoch 一份）
         result_dir = os.path.join("result", f"fold{val_fold}")
         os.makedirs(result_dir, exist_ok=True)
         out_path = os.path.join(result_dir, f"val_subject_hitmiss_e{epoch:03d}.json")
-
         items = [{"subject_id": int(s), **v}
-                for s, v in sorted(per_subject.items(), key=lambda kv: (1_000_000_000 if kv[0] < 0 else kv[0]))]
-
+                 for s, v in sorted(per_subject.items(), key=lambda kv: (1_000_000_000 if kv[0] < 0 else kv[0]))]
         payload = {
             "epoch": int(epoch),
             "best_thr": float(best_thr),
@@ -903,8 +1058,7 @@ def train(train_loader, val_loader, device, val_fold):
             json.dump(payload, f, ensure_ascii=False, indent=2)
         print(f"[VAL] 每受试者命中/失误统计已写入：{out_path}")
 
-
-        # === 你要求的打印格式 ===
+        # 训练/验证摘要
         print(f"Epoch {epoch:3d}/{EPOCHS}")
         print(f"  Train: ConLoss={total_cl/max(1,total):.4f}, ClasLoss={total_cls/max(1,total):.4f}  "
               f"Acc={train_acc:.2f}%  pos_rate={train_pos_rate:.2f}  (lr=[{lr_min:.2e}, {lr_max:.2e}])")
@@ -913,7 +1067,7 @@ def train(train_loader, val_loader, device, val_fold):
               f"thr*={best_thr:.2f}  pos_rate@thr*={pos_rate_at_thr*100:.2f}")
         print(f"  CM:\n{cm}")
 
-        # 调度器与保存最优
+        # 调度 & 保存 best
         scheduler.step(balacc_v)
         if balacc_v > best_val:
             best_val = balacc_v
@@ -934,11 +1088,11 @@ def train(train_loader, val_loader, device, val_fold):
                 "ema": ema.shadow
             }, "best_ckpt_spatial_only.pth")
 
-   
+    # 训练结束返回
     return {
         "best_epoch": int(best_pack["epoch"]),
         "best_bal_acc": float(best_pack["balacc"] * 100.0),
-        "val_acc": float(val_acc),               # 最后一个 epoch 的验证 Acc（如需 best-epoch 的，可一起存）
+        "val_acc": float(val_acc),
         "f1": float(best_pack["f1"]),
         "auc": float(best_pack["auc"]),
         "best_thr": float(best_pack["thr"]),
@@ -946,9 +1100,12 @@ def train(train_loader, val_loader, device, val_fold):
 
 
 def run_single_fold(slices_root="./slices", val_fold=1, folds=5, epochs=EPOCHS, batch_size=64,
-                    use_ae_encoder=True, ae_ckpt="./ae_ckpts/ae_best.pth",
-                    ae_in_ch=3, ae_latent_ch=3, ae_device="cpu"):
-    """把 overlap 折作为训练集，nonoverlap 折作为验证集；真正构造 DataLoader 再调用 train()。"""
+                    use_ae_encoder=False, ae_ckpt="./ae_ckpts/ae_best.pth",
+                    ae_in_ch=3, ae_latent_ch=3, ae_device="cuda"):
+    """
+    overlap 折作为训练集，nonoverlap 折作为验证集。
+    ★ 本函数里 Dataset 不做 AE/WT 重活；AE/WT 都在 train() 内的 GPU 上做。
+    """
 
     def has_npz(dir_):
         return os.path.isdir(dir_) and any(f.endswith(".npz") for f in os.listdir(dir_))
@@ -982,38 +1139,47 @@ def run_single_fold(slices_root="./slices", val_fold=1, folds=5, epochs=EPOCHS, 
     print("Val:", val_dir)
     print(f"Result dir: {result_dir}")
 
-
-    device = torch.device("cuda" if (torch.cuda.is_available() ) else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pin_memory = (device.type == "cuda")
 
     train_datasets = [
         EEGFeatureDataset(
-            feature_path=td, augment=True,
-            use_ae_encoder=use_ae_encoder, ae_ckpt=ae_ckpt,
-            ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch, ae_device="cpu",
-            wave_name="coif1", wt_device="cpu"
+            feature_path=td,
+            augment=True
         ) for td in train_dirs
     ]
     train_ds = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
 
-    # 验证集
+    # 验证集（nonoverlap）
     val_ds = EEGFeatureDataset(
-        feature_path=val_dir, augment=False,
-        use_ae_encoder=use_ae_encoder, ae_ckpt=ae_ckpt,
-        ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch, ae_device="cpu",
-        wave_name="coif1", wt_device="cpu"
+        feature_path=val_dir,
+        augment=False
     )
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=4, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=max(4, (os.cpu_count() or 8)//2),
+        pin_memory=pin_memory, persistent_workers=True, prefetch_factor=4
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=max(2, (os.cpu_count() or 8)//4),
+        pin_memory=pin_memory, persistent_workers=True, prefetch_factor=2
+    )
 
-    with tee_stdout(log_path):
-        metrics = train(train_loader=train_loader, val_loader=val_loader, device=device, val_fold=val_fold)
+    # 交给 train()：在 GPU 里创建 WT & AE
+    metrics = train(
+        train_loader=train_loader, val_loader=val_loader, device=device, val_fold=val_fold,
+        use_ae_encoder=use_ae_encoder,  # 若想启用AE，传 True（但Dataset仍然不做）
+        ae_ckpt=ae_ckpt, ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch
+    )
 
     print(f"[DONE] Fold {val_fold} 最优 BalAcc={metrics['best_bal_acc']:.2f}% (epoch {metrics['best_epoch']})，"
           f"Acc={metrics['val_acc']:.2f}%  F1={metrics['f1']:.3f}  AUC={metrics['auc']:.3f}  thr*={metrics['best_thr']:.2f}")
     print(f"控制台日志保存在：{log_path}")
     return metrics
+
 
 
 def parse_args():

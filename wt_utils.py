@@ -11,17 +11,17 @@ class WaveletTransform(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor):
-        x = x.to(self._device).float()
-        yl1, yh1_list = self.dwt1(x)  # yl1: [B,C,H/2,W/2], yh1_list[0]: [B,C,3,H/2,W/2]
+        x = x.to(self._device, non_blocking=True).float()
+        yl1, yh1_list = self.dwt1(x)
         yh1 = yh1_list[0]
         return yl1, yh1[:, :, 0], yh1[:, :, 1], yh1[:, :, 2]
 
     @torch.no_grad()
-    def inverse(self, low: torch.Tensor, hh: torch.Tensor, hv: torch.Tensor, hd: torch.Tensor):
-        yl = low.to(self._device).float()
-        yh = torch.stack([hh, hv, hd], dim=2).to(self._device).float()  # [B,C,3,H/2,W/2]
-        x = self.idwt1((yl, [yh]))
-        return x
+    def inverse(self, low, hh, hv, hd):
+        yl = low.to(self._device, non_blocking=True).float()
+        yh = torch.stack([hh, hv, hd], dim=2).to(self._device, non_blocking=True).float()
+        return self.idwt1((yl, [yh]))
+
 
 @torch.no_grad()
 def pad_to_even(x: torch.Tensor):
