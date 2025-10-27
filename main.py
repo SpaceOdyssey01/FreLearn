@@ -8,6 +8,88 @@ from collections import defaultdict
 from typing import List
 import time
 from contextlib import contextmanager
+class LayerNorm2d(nn.Module):
+    """对 [B,C,H,W] 按通道做 LN（更稳定），等价于 torchvision 中常用的 LN2d 写法。"""
+    def __init__(self, num_channels, eps=1e-6):
+        super().__init__()
+        self.ln = nn.LayerNorm(num_channels, eps=eps)
+    def forward(self, x):
+        # x:[B,C,H,W] -> [B,H,W,C] -> LN -> [B,C,H,W]
+        return self.ln(x.permute(0,2,3,1)).permute(0,3,1,2)
+
+class DepthwiseConv(nn.Module):
+    def __init__(self, c, k=3, s=1, p=1):
+        super().__init__()
+        self.conv = nn.Conv2d(c, c, k, s, p, groups=c, bias=True)
+    def forward(self, x): return self.conv(x)
+
+class SpatialGate(nn.Module):
+    """空间门控：DW 3x3 -> Sigmoid，输出[B,1,H,W]；对特征逐像素缩放。"""
+    def __init__(self, c):
+        super().__init__()
+        self.dw = DepthwiseConv(c, k=3, p=1)
+        self.proj = nn.Conv2d(c, 1, kernel_size=1, bias=True)
+    def forward(self, x):
+        m = self.proj(self.dw(x)).sigmoid()
+        return x * m
+
+class SqueezeExcite(nn.Module):
+    """通道注意：SE。"""
+    def __init__(self, c, r=4):
+        super().__init__()
+        hid = max(8, c // r)
+        self.avg = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(c, hid, 1, bias=True), nn.ReLU(inplace=True),
+            nn.Conv2d(hid, c, 1, bias=True), nn.Sigmoid()
+        )
+    def forward(self, x):
+        w = self.fc(self.avg(x))
+        return x * w
+class SpAMResidual(nn.Module):
+    """
+    输入:  x_in  [B, Cin, Hin, Win]
+    目标:  调整/增强为与 x_rec 匹配的 [B, Cout, Hout, Wout]，并做残差（投影）输出
+    结构:  LNorm -> DW3x3 -> PW1x1(到2C) -> DW3x3 -> SpatialGate -> SE -> PW1x1(到Cout)
+         + Skip(1x1投影到Cout)  （需要时做尺寸/通道适配）
+    """
+    def __init__(self, cin, cout):
+        super().__init__()
+        cmid = max(cin, cout)
+        self.norm = LayerNorm2d(cin)
+        self.dw1  = DepthwiseConv(cin, k=3, p=1)
+        self.pw   = nn.Conv2d(cin, 2*cmid, kernel_size=1, bias=True)
+        self.dw2  = DepthwiseConv(2*cmid, k=3, p=1)
+        self.sg   = SpatialGate(2*cmid)
+        self.se   = SqueezeExcite(2*cmid, r=4)
+        self.out  = nn.Conv2d(2*cmid, cout, kernel_size=1, bias=True)
+        # 残差投影，Cin != Cout 时用 1x1；相等则恒等
+        self.skip = nn.Conv2d(cin, cout, kernel_size=1, bias=True) if cin != cout else nn.Identity()
+
+    @torch.no_grad()
+    def _resize(self, x, size):
+        if x.shape[-2:] == size: return x
+        # 与你现有 Resize2D(mode="area") 一致：更像平均池化，数值更稳
+        return F.interpolate(x, size=size, mode="area")
+
+    def forward(self, x_in, target_size):
+        # 1) 尺寸对齐（只在需要时插值）
+        if x_in.shape[-2:] != target_size:
+            x = self._resize(x_in, target_size)
+        else:
+            x = x_in
+        # 2) 主干
+        y = self.norm(x)
+        y = self.dw1(y)
+        y = F.gelu(self.pw(y), approximate='tanh')
+        y = self.dw2(y)
+        y = self.sg(y)
+        y = self.se(y)
+        y = self.out(y)
+        # 3) Skip & 残差
+        s = self.skip(x)
+        return y + s   # 输出: [B, Cout, Hout, Wout]
+
 
 class StepProfiler:
     def __init__(self, device, name="train", max_batches=100):
@@ -569,15 +651,20 @@ def stage_spatial_fusion_iwt(
     return x_out, cl_loss
 
 
-
-class ResidualFuseMap(nn.Module):
-    def __init__(self, d_vec: int):
+class ResidualFuseMap_SpAM(nn.Module):
+    def __init__(self, cin, cout, gate_in_dim):
         super().__init__()
-        self.beta = nn.Sequential(nn.LayerNorm(d_vec), nn.Linear(d_vec, 1))
+        self.spam = SpAMResidual(cin, cout)          # 新增：对原始路做 SpAM 预处理
+        self.beta = nn.Sequential(                   # 沿用你原来的“回归标量 b”的头
+            nn.Linear(gate_in_dim, gate_in_dim//2), nn.ReLU(inplace=True),
+            nn.Linear(gate_in_dim//2, 1), nn.Sigmoid()
+        )
 
-    def forward(self, fused: torch.Tensor, x_in: torch.Tensor, recon: torch.Tensor):
-        b = torch.sigmoid(self.beta(fused)).view(-1, 1, 1, 1)
-        return (1.0 - b) * x_in + b * recon
+    def forward(self, gate_vec, x_in, x_rec):
+        B, Cout, Hout, Wout = x_rec.shape
+        x_spam = self.spam(x_in, target_size=(Hout, Wout))
+        b = self.beta(gate_vec).view(B, 1, 1, 1)
+        return (1.0 - b) * x_spam + b * x_rec
 
 
 class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
@@ -680,8 +767,7 @@ def _build_ae_if_needed(use_ae_encoder: bool, device, ae_ckpt: str, ae_in_ch: in
     if not use_ae_encoder:
         return None
 
-    # 你自己的 AE 类名（按需改成你项目里的类/构造函数）
-    AE_CANDIDATE_NAMES = ["AE", "AutoEncoder", "AEEncoder", "EEGAE"]
+    AE_CANDIDATE_NAMES = ["AE", "Autoencoder2D"]
 
     ae_cls = None
     for name in AE_CANDIDATE_NAMES:
@@ -735,6 +821,11 @@ def train(train_loader, val_loader, device, val_fold,
 
     # 2) AE（只在循环里做 encode）
     ae = _build_ae_if_needed(use_ae_encoder, device, ae_ckpt, ae_in_ch, ae_latent_ch)
+    ae_adapter = nn.Identity().to(device)
+    if ae is not None and ae_latent_ch != 3:
+        ae_adapter = nn.Conv2d(ae_latent_ch, 3, kernel_size=1, bias=False).to(device)
+        for p in ae_adapter.parameters():
+            p.requires_grad_(False)  # 不训练
 
     # 3) 其余模块定义（与你原来的保持一致）
     def _mk_proj():
@@ -750,7 +841,8 @@ def train(train_loader, val_loader, device, val_fold,
 
     high_gate_map = HighGateMap(c_in=3).to(device)
     alpha_hl      = AlphaHL(c_in=3).to(device)
-    resfuser      = ResidualFuseMap(d_vec=3).to(device)
+    resfuser = ResidualFuseMap_SpAM(cin=3, cout=3, gate_in_dim=3).to(device)
+
     classifier    = ClassifierFrom3(num_classes=NUM_CLASSES, hidden=32, dropout=DROPOUT).to(device)
 
     hlf_seq_loss1 = HLF_RelationLoss_BP(temperature=0.15, pool_hw=(4,4), proj_hidden=64, proj_out=32, p_drop=0.2).to(device)
@@ -837,7 +929,9 @@ def train(train_loader, val_loader, device, val_fold,
                 # 2) （可选）AE 编码：在 GPU 上做
                 if ae is not None and hasattr(ae, "encode"):
                     with torch.no_grad():
-                        x = ae.encode(x)  # x 仍在 GPU 上
+                        x01 = minmax_unit(x)          # 归一化到 [0,1]，与 AE 训练时一致
+                        z, _, _ = ae.encode(x01)      # 取 z；AE: (z, e1, e2)
+                    x = ae_adapter(z)                 # 若 z 通道不是 3，这里 1×1 conv 对齐
 
                 _, _, dt_to = start_end()
             prof.add_to(dt_to)
@@ -948,7 +1042,10 @@ def train(train_loader, val_loader, device, val_fold,
                         # 2) （可选）AE 编码：在 GPU 上做
                         if ae is not None and hasattr(ae, "encode"):
                             with torch.no_grad():
-                                x = ae.encode(x)  # x 仍在 GPU 上
+                                x01 = minmax_unit(x)          # 归一化到 [0,1]，与 AE 训练时一致
+                                z, _, _ = ae.encode(x01)      # 取 z；AE: (z, e1, e2)
+                            x = ae_adapter(z)                 # 若 z 通道不是 3，这里 1×1 conv 对齐
+
 
                         _, _, dt_to = start_end()
                     prof_val.add_to(dt_to)

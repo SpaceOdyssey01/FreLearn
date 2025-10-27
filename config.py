@@ -42,3 +42,8 @@ NUM_CLASSES = 2
 W_CL  = 0.5   # 对比学习总权重
 W_CLS = 1.0
 CL_SCALE = 0.02
+
+USE_AE_ENCODER = True              # 打开/关闭：第一次WT前启用AE编码
+AE_WEIGHTS = "./ae/encoder.pth"    # 你的权重路径：encoder.pth 或 ae_best.pth
+AE_IN_CH = 3                       # 输入通道
+AE_LATENT_CH = 3                   # 想保持3通道就设为3；若你训练时是64，这里也可设64但需适配器
