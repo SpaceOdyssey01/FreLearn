@@ -13,28 +13,28 @@ import argparse
 from pytorch_wavelets import DWTForward, DWTInverse
 import time
 from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score
-FOLD = 3
+FOLD = 4
 DROPOUT = 0.5
 NOISE = 0
 EPOCHS = 200
-HEAD_LR = 8e-4
-BACKBONE_LR = 2e-4
+HEAD_LR = 10e-4
+BACKBONE_LR = 2.5e-4
 WEIGHT_DECAY = 1e-4
 BALANCE_LOSS_W = 1e-3
 PATIENCE = 180
 EMA_DECAY = 0.997
-STAGE1_SCALE = 0.8 # Stage-1 分数缩放（1.0 表示不缩）
-STAGEM_SCALE = 0.8  # Stage-M 分数缩放
+STAGE1_SCALE = 1.0 # Stage-1 分数缩放（1.0 表示不缩）
+STAGEM_SCALE = 1.0  # Stage-M 分数缩放
 
-PROB_BAL_W = 0
+PROB_BAL_W = 1e-4
 GATE_REG_W = 1e-3
-MIXUP_ALPHA = 0.2
+MIXUP_ALPHA = 0.1
 MIXUP_STOP_FR = 0.4
 SUBBAND_DROP_P = 0
 
 HIGH = 0.35
 LOW = 0.25
-TARGET_HIGH = 1.08
+TARGET_HIGH = 1.1
 TARGET_LOW = 1.02
 SMOOTH = 0.5
 W_CL1, W_CLM, W_CL2 = 1.0, 1.0, 1.0
@@ -42,8 +42,3 @@ NUM_CLASSES = 2
 W_CL  = 0.5   # 对比学习总权重
 W_CLS = 1.0
 CL_SCALE = 0.02
-
-USE_AE_ENCODER = True              # 打开/关闭：第一次WT前启用AE编码
-AE_WEIGHTS = "./ae/encoder.pth"    # 你的权重路径：encoder.pth 或 ae_best.pth
-AE_IN_CH = 3                       # 输入通道
-AE_LATENT_CH = 3                   # 想保持3通道就设为3；若你训练时是64，这里也可设64但需适配器

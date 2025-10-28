@@ -239,29 +239,62 @@ class MetricsLogger:
 
 
 class tee_stdout:
-    def __init__(self, path):
-        os.makedirs(os.path.dirname(path), exist_ok=True); self.path = path; self.file = None; self._stdout = None
+    def __init__(self, path, also_stderr=True):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.path = path
+        self.file = None
+        self._stdout = None
+        self._stderr = None
+        self.also_stderr = also_stderr
 
     def __enter__(self):
-        self.file = open(self.path, "w", encoding="utf-8"); self._stdout = sys.stdout; sys.stdout = self; return self
+        self.file = open(self.path, "w", encoding="utf-8")
+        self._stdout = sys.stdout
+        sys.stdout = self
+        if self.also_stderr:
+            self._stderr = sys.stderr
+            sys.stderr = self
+        return self
 
     def write(self, s):
-        if self._stdout and not getattr(self._stdout, "closed", False): self._stdout.write(s); self._stdout.flush()
-        if self.file and not self.file.closed: self.file.write(s); self.file.flush(); return len(s)
+        # 同时写到原始 stdout/stderr 与文件
+        if self._stdout and not getattr(self._stdout, "closed", False):
+            self._stdout.write(s)
+            self._stdout.flush()
+        if self.also_stderr and self._stderr and not getattr(self._stderr, "closed", False):
+            # 避免重复写到终端：只要一个通道就够了
+            pass
+        if self.file and not self.file.closed:
+            self.file.write(s)
+            self.file.flush()
+        return len(s)
 
     def flush(self):
         try:
-            if self._stdout and not getattr(self._stdout, "closed", False): self._stdout.flush()
+            if self._stdout and not getattr(self._stdout, "closed", False):
+                self._stdout.flush()
         except:
             pass
         try:
-            if self.file and not self.file.closed: self.file.flush()
+            if self.also_stderr and self._stderr and not getattr(self._stderr, "closed", False):
+                self._stderr.flush()
+        except:
+            pass
+        try:
+            if self.file and not self.file.closed:
+                self.file.flush()
         except:
             pass
 
     def __exit__(self, exc_type, exc, tb):
+        # 先把 stdout/stderr 复原
         sys.stdout = self._stdout if self._stdout is not None else sys.__stdout__
-        if self.file and not self.file.closed: self.file.close()
+        if self.also_stderr:
+            sys.stderr = self._stderr if self._stderr is not None else sys.__stderr__
+        # 再关文件
+        if self.file and not self.file.closed:
+            self.file.close()
+        # 返回 False 让异常继续抛出（也会被写入到日志文件中）
         return False
 
 
@@ -1195,7 +1228,6 @@ def train(train_loader, val_loader, device, val_fold,
         "best_thr": float(best_pack["thr"]),
     }
 
-
 def run_single_fold(slices_root="./slices", val_fold=1, folds=5, epochs=EPOCHS, batch_size=64,
                     use_ae_encoder=False, ae_ckpt="./ae_ckpts/ae_best.pth",
                     ae_in_ch=3, ae_latent_ch=3, ae_device="cuda"):
@@ -1228,53 +1260,57 @@ def run_single_fold(slices_root="./slices", val_fold=1, folds=5, epochs=EPOCHS, 
         raise RuntimeError(f"验证目录无 .npz：{val_dir}")
 
     result_dir = os.path.join("result", f"fold{val_fold}")
+    os.makedirs(result_dir, exist_ok=True)
     stamp = time.strftime('%Y%m%d_%H%M%S')
     log_path = os.path.join(result_dir, f"console_{stamp}.log")
-    os.makedirs(result_dir, exist_ok=True)
-    print(f"\n========== Single Run（验证=Fold {val_fold} nonoverlap；训练=其余折 overlap）==========")
-    for td in train_dirs: print("  -", td)
-    print("Val:", val_dir)
-    print(f"Result dir: {result_dir}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pin_memory = (device.type == "cuda")
+    # —— 从这里开始，把整个流程的“控制台输出”同时写入 log_path
+    with tee_stdout(log_path, also_stderr=True):
+        print(f"\n========== Single Run（验证=Fold {val_fold} nonoverlap；训练=其余折 overlap）==========")
+        for td in train_dirs: print("  -", td)
+        print("Val:", val_dir)
+        print(f"Result dir: {result_dir}")
+        print(f"[LOG] 所有控制台输出已同步写入：{log_path}")
 
-    train_datasets = [
-        EEGFeatureDataset(
-            feature_path=td,
-            augment=True
-        ) for td in train_dirs
-    ]
-    train_ds = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        pin_memory = (device.type == "cuda")
 
-    # 验证集（nonoverlap）
-    val_ds = EEGFeatureDataset(
-        feature_path=val_dir,
-        augment=False
-    )
+        train_datasets = [
+            EEGFeatureDataset(
+                feature_path=td,
+                augment=True
+            ) for td in train_dirs
+        ]
+        train_ds = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
 
+        # 验证集（nonoverlap）
+        val_ds = EEGFeatureDataset(
+            feature_path=val_dir,
+            augment=False
+        )
 
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=max(4, (os.cpu_count() or 8)//2),
-        pin_memory=pin_memory, persistent_workers=True, prefetch_factor=4
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=max(2, (os.cpu_count() or 8)//4),
-        pin_memory=pin_memory, persistent_workers=True, prefetch_factor=2
-    )
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=max(4, (os.cpu_count() or 8)//2),
+            pin_memory=pin_memory, persistent_workers=True, prefetch_factor=4
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size, shuffle=False,
+            num_workers=max(2, (os.cpu_count() or 8)//4),
+            pin_memory=pin_memory, persistent_workers=True, prefetch_factor=2
+        )
 
-    # 交给 train()：在 GPU 里创建 WT & AE
-    metrics = train(
-        train_loader=train_loader, val_loader=val_loader, device=device, val_fold=val_fold,
-        use_ae_encoder=use_ae_encoder,  # 若想启用AE，传 True（但Dataset仍然不做）
-        ae_ckpt=ae_ckpt, ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch
-    )
+        # 交给 train()：在 GPU 里创建 WT & AE
+        metrics = train(
+            train_loader=train_loader, val_loader=val_loader, device=device, val_fold=val_fold,
+            use_ae_encoder=use_ae_encoder,  # 若想启用AE，传 True（但Dataset仍然不做）
+            ae_ckpt=ae_ckpt, ae_in_ch=ae_in_ch, ae_latent_ch=ae_latent_ch
+        )
 
-    print(f"[DONE] Fold {val_fold} 最优 BalAcc={metrics['best_bal_acc']:.2f}% (epoch {metrics['best_epoch']})，"
-          f"Acc={metrics['val_acc']:.2f}%  F1={metrics['f1']:.3f}  AUC={metrics['auc']:.3f}  thr*={metrics['best_thr']:.2f}")
-    print(f"控制台日志保存在：{log_path}")
+        print(f"[DONE] Fold {val_fold} 最优 BalAcc={metrics['best_bal_acc']:.2f}% (epoch {metrics['best_epoch']})，"
+              f"Acc={metrics['val_acc']:.2f}%  F1={metrics['f1']:.3f}  AUC={metrics['auc']:.3f}  thr*={metrics['best_thr']:.2f}")
+        print(f"[LOG] 控制台日志保存在：{log_path}")
+
     return metrics
 
 
