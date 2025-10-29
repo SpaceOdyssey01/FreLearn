@@ -8,6 +8,64 @@ from collections import defaultdict
 from typing import List
 import time
 from contextlib import contextmanager
+
+# ===== Param Counter Utils =====
+def _unique_param_iter(modules, trainable_only=True):
+    """跨多个模块遍历参数并去重（按 data_ptr()）。"""
+    seen = set()
+    for m in modules:
+        for p in m.parameters(recurse=True):
+            if trainable_only and not p.requires_grad:
+                continue
+            if p is None:
+                continue
+            ptr = p.data_ptr()
+            if ptr in seen:
+                continue
+            seen.add(ptr)
+            yield p
+
+def count_params(modules, trainable_only=True):
+    """统计一组模块的（去重后）参数数量。"""
+    if not isinstance(modules, (list, tuple)):
+        modules = [modules]
+    return sum(p.numel() for p in _unique_param_iter(modules, trainable_only=trainable_only))
+
+def count_by_module(modules, trainable_only=True):
+    """返回 {name: num_params}，modules 传入 list[(name, module), ...]。"""
+    out = {}
+    for name, m in modules:
+        out[name] = count_params([m], trainable_only=trainable_only)
+    return out
+
+def count_from_optimizer(optimizer):
+    """统计 optimizer 当前 param_groups 中实际会被更新的参数数量（去重）。"""
+    seen = set()
+    total = 0
+    for pg in optimizer.param_groups:
+        for p in pg.get("params", []):
+            if p is None or p.grad is None and not p.requires_grad:
+                # 只要在 param_groups 且 requires_grad=True，就会被更新；grad 此刻可能还没产生
+                pass
+            if p is None or not p.requires_grad:
+                continue
+            ptr = p.data_ptr()
+            if ptr in seen:
+                continue
+            seen.add(ptr)
+            total += p.numel()
+    return total
+
+def humanize(n: int) -> str:
+    """人性化显示参数量：带千分位与近似单位。"""
+    if n < 1_000:
+        return f"{n}"
+    if n < 1_000_000:
+        return f"{n/1_000:.1f}K"
+    if n < 1_000_000_000:
+        return f"{n/1_000_000:.2f}M"
+    return f"{n/1_000_000_000:.2f}B"
+
 class LayerNorm2d(nn.Module):
     """对 [B,C,H,W] 按通道做 LN（更稳定），等价于 torchvision 中常用的 LN2d 写法。"""
     def __init__(self, num_channels, eps=1e-6):
@@ -147,13 +205,13 @@ class StepProfiler:
         n = max(1, min(self.n, self.max_batches))
         total = (self.t_fetch + self.t_to + self.t_fwd + self.t_bwd + self.t_opt) / n
         lines = [
-            f"[Profile:{self.name}] per-step avg over {n} batches (sec):",
-            f"  fetch(DataLoader): {self.t_fetch/n:.4f}",
-            f"  to(device)      : {self.t_to/n:.4f}",
-            f"  forward+loss    : {self.t_fwd/n:.4f}",
-            f"  backward        : {self.t_bwd/n:.4f}",
-            f"  optimizer step  : {self.t_opt/n:.4f}",
-            f"  ---- total(step): {total:.4f} sec"
+            # f"[Profile:{self.name}] per-step avg over {n} batches (sec):",
+            # f"  fetch(DataLoader): {self.t_fetch/n:.4f}",
+            # f"  to(device)      : {self.t_to/n:.4f}",
+            # f"  forward+loss    : {self.t_fwd/n:.4f}",
+            # f"  backward        : {self.t_bwd/n:.4f}",
+            # f"  optimizer step  : {self.t_opt/n:.4f}",
+            # f"  ---- total(step): {total:.4f} sec"
         ]
         print("\n".join(lines))
 
@@ -716,14 +774,26 @@ class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
         cosf = 0.5 * (1 + math.cos(math.pi * t))
         return [base_lr * (self.min_factor + (1 - self.min_factor) * cosf) for base_lr in self.base_lrs]
 
+# === PATCH: 更强分类头（两层MLP，默认 hidden=128）
 class ClassifierFrom3(nn.Module):
-    def __init__(self, num_classes, hidden=32, dropout=DROPOUT):
+    def __init__(self, in_dim=3, num_classes=2, hidden=128, dropout=0.30):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(3, hidden), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden, num_classes)
+        # 你当前是对 low2_f 做全局平均得到 vec2（维度≈通道数/3），为了兼容，保留 in_dim 形参
+        self.head = nn.Sequential(
+            nn.Linear(in_dim, hidden, bias=True),
+            nn.BatchNorm1d(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, num_classes, bias=True)
         )
-    def forward(self, x): return self.net(x)
+        # 可选：按先验初始化 bias（下一节F会细讲）
+        # with torch.no_grad():
+        #     pi = 0.5
+        #     self.head[-1].bias.fill_(math.log(pi/(1-pi)))
+
+    def forward(self, x):       # x: [B, in_dim]
+        return self.head(x)
+
 
 def param_groups(module):
     decay, no_decay = [], []
@@ -876,7 +946,8 @@ def train(train_loader, val_loader, device, val_fold,
     alpha_hl      = AlphaHL(c_in=3).to(device)
     resfuser = ResidualFuseMap_SpAM(cin=3, cout=3, gate_in_dim=3).to(device)
 
-    classifier    = ClassifierFrom3(num_classes=NUM_CLASSES, hidden=32, dropout=DROPOUT).to(device)
+    classifier = ClassifierFrom3(in_dim=3, num_classes=NUM_CLASSES, hidden=128, dropout=0.30).to(device)
+
 
     hlf_seq_loss1 = HLF_RelationLoss_BP(temperature=0.15, pool_hw=(4,4), proj_hidden=64, proj_out=32, p_drop=0.2).to(device)
     hlf_seq_lossM = HLF_RelationLoss_BP(temperature=0.15, pool_hw=(4,4), proj_hidden=64, proj_out=32, p_drop=0.2).to(device)
@@ -900,6 +971,91 @@ def train(train_loader, val_loader, device, val_fold,
     optimizer  = torch.optim.AdamW(optim_params)
     scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=10)
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
+    # ===== 参数量精确统计（去重、可训练为主） =====
+    group_projectors = [
+        ("proj_low_1",  conv_low_1), ("proj_hh_1",  conv_hh_1), ("proj_hv_1",  conv_hv_1), ("proj_hd_1",  conv_hd_1),
+        ("proj_low_M",  conv_low_M), ("proj_hh_M",  conv_hh_M), ("proj_hv_M",  conv_hv_M), ("proj_hd_M",  conv_hd_M),
+        ("proj_low_2",  conv_low_2), ("proj_hh_2",  conv_hh_2), ("proj_hv_2",  conv_hv_2), ("proj_hd_2",  conv_hd_2),
+    ]
+    group_heads = [
+        ("high_gate_map", high_gate_map),
+        ("alpha_hl",      alpha_hl),
+        ("resfuser",      resfuser),
+        ("classifier",    classifier),
+    ]
+    group_hlf = [
+        ("hlf_seq_loss1", hlf_seq_loss1),
+        ("hlf_seq_lossM", hlf_seq_lossM),
+        ("hlf_seq_loss2", hlf_seq_loss2),
+    ]
+
+    # （可选）若 AE 启动并且你真的让它参与训练（默认你是冻结的），也可以纳入单独一组：
+    group_ae = []
+    if (ae is not None):
+        # 注意：你上面把 ae.parameters().requires_grad_(False) 了；若想统计“全部参数”，把 trainable_only=False
+        group_ae.append(("ae_encoder", ae))
+        # 若 ae_adapter 是 1x1 conv 且冻结了，也可单列：
+        group_ae.append(("ae_adapter", ae_adapter))
+
+    # ---- 统计每个分组的参数量（可训练） ----
+    by_proj = count_by_module(group_projectors, trainable_only=True)
+    by_heads = count_by_module(group_heads, trainable_only=True)
+    by_hlf = count_by_module(group_hlf, trainable_only=True)
+    by_ae = count_by_module(group_ae, trainable_only=True) if group_ae else {}
+
+    # 合并所有需要训练的模块用于“总量”统计
+    all_trainables = [m for _, m in group_projectors + group_heads + group_hlf] + [m for _, m in group_ae]
+
+    total_trainable_params = count_params(all_trainables, trainable_only=True)
+    total_from_optimizer   = count_from_optimizer(optimizer)  # 与 optimizer 的 param_groups 交叉核对
+
+    # （可选）如果你也想看“总参数量”（含冻结参数），再算一遍：
+    total_all_params = count_params(all_trainables, trainable_only=False)
+
+    # ---- 打印结果 ----
+    print("\n[PARAM] ========== Parameter Count (trainable only) ==========")
+    def _print_group(title, d):
+        if not d:
+            return
+        width = max((len(k) for k in d.keys()), default=12)
+        tot = sum(d.values())
+        print(f"[{title}] total = {humanize(tot)} ({tot:,})")
+        for k, v in sorted(d.items(), key=lambda kv: kv[0]):
+            print(f"  {k.ljust(width)} : {humanize(v)} ({v:,})")
+
+    _print_group("Projectors (12)", by_proj)
+    _print_group("Heads (gate/alpha/resfuser/classifier)", by_heads)
+    _print_group("HLF_RelationLoss_BP (3)", by_hlf)
+    _print_group("AE (if any, trainable)", by_ae)
+
+    print(f"[Total Trainable] by modules : {humanize(total_trainable_params)} ({total_trainable_params:,})")
+    print(f"[Total Trainable] by optimizer param_groups : {humanize(total_from_optimizer)} ({total_from_optimizer:,})")
+    if total_trainable_params != total_from_optimizer:
+        print(f"[WARN] mismatch between module-scan and optimizer groups: "
+            f"{total_trainable_params:,} vs {total_from_optimizer:,}")
+
+    print(f"[Total All Params] (incl. frozen) : {humanize(total_all_params)} ({total_all_params:,})\n")
+
+    # ---- 写 JSON 报告到 result/fold{val_fold} ----
+    try:
+        result_dir = os.path.join("result", f"fold{val_fold}")
+        os.makedirs(result_dir, exist_ok=True)
+        report_path = os.path.join(result_dir, "params_report.json")
+        report = {
+            "by_projector": by_proj,
+            "by_heads": by_heads,
+            "by_hlf": by_hlf,
+            "by_ae": by_ae,
+            "total_trainable_by_modules": int(total_trainable_params),
+            "total_trainable_by_optimizer": int(total_from_optimizer),
+            "total_all_params": int(total_all_params),
+        }
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        print(f"[PARAM] 报告已写入：{report_path}")
+    except Exception as e:
+        print(f"[PARAM][WARN] 写入参数报告失败：{e}")
+
 
     ema_modules = {
         "low1": conv_low_1, "hh1": conv_hh_1, "hv1": conv_hv_1, "hd1": conv_hd_1,
@@ -1008,16 +1164,30 @@ def train(train_loader, val_loader, device, val_fold,
 
                     cl_loss_total = W_CL1 * cl1 + W_CLM * clM + W_CL2 * cl2
                     cl_loss_total = CL_SCALE * cl_loss_total
-                    loss = W_CL * cl_loss_total + W_CLS * cls_loss
+                    pb_loss  = prob_balance_loss_from_logits(logits)   # 来自 contrast.py 的函数
+                    PB_W     = 1e-3
+                    loss     = W_CL * cl_loss_total + W_CLS * cls_loss + PB_W * pb_loss
                 _, _, dt_fwd = start_end()
             prof.add_fwd(dt_fwd)
 
             with prof._evt() as start_end:
                 scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(classifier.parameters(), max_norm=5.0)
+
+                # === PATCH: 扩大梯度裁剪范围（不仅裁分类头） ===
+                # 1) 使用 AMP 时，先把梯度从缩放状态还原，否则裁剪阈值失真
+                scaler.unscale_(optimizer)
+
+                # 2) 收集“当前优化器里实际参与训练”的全部参数（兼容后续冻结/解冻）
+                params_to_clip = []
+                for pg in optimizer.param_groups:
+                    for p in pg["params"]:
+                        if p is not None and p.requires_grad and p.grad is not None:
+                            params_to_clip.append(p)
+
+                # 3) 统一裁剪这些参数的梯度范数
+                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=5.0)
                 scaler.step(optimizer)
                 scaler.update()
-
                 ema.update(ema_modules)
                 _, _, dt_bwd = start_end()
             prof.add_bwd(dt_bwd)
@@ -1117,7 +1287,9 @@ def train(train_loader, val_loader, device, val_fold,
 
                         cl_loss_total = W_CL1 * cl1 + W_CLM * clM + W_CL2 * cl2
                         cl_loss_total = CL_SCALE * cl_loss_total
-                        loss = W_CL * cl_loss_total + W_CLS * cls_loss
+                        pb_loss  = prob_balance_loss_from_logits(logits)   # 来自 contrast.py 的函数
+                        PB_W     = 1e-3
+                        loss     = W_CL * cl_loss_total + W_CLS * cls_loss + PB_W * pb_loss
                         _, _, dt_fwd = start_end()
                     prof_val.add_fwd(dt_fwd)
                     prof_val.step_done()
@@ -1186,7 +1358,7 @@ def train(train_loader, val_loader, device, val_fold,
         }
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
-        print(f"[VAL] 每受试者命中/失误统计已写入：{out_path}")
+
 
         # 训练/验证摘要
         print(f"Epoch {epoch:3d}/{EPOCHS}")
